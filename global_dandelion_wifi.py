@@ -19,8 +19,16 @@ import signal
 import re
 import queue
 import sys
+import io
 from datetime import datetime
 from collections import deque
+
+# --- [修复] 强制UTF-8编码以避免UnicodeEncodeError ---
+# 在某些精简的Linux环境中，默认编码可能是ASCII，这会导致打印中文字符时出错。
+# 这段代码会检查并强制将标准输出/错误流的编码设置为UTF-8。
+if sys.stdout.encoding != 'UTF-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 # --- [优化] 检测运行环境 ---
 IS_INTERACTIVE = sys.stdout.isatty()
@@ -47,13 +55,11 @@ except ImportError:
 # --- 文件与全局控制 ---
 MIN_FILE_DELAY_S = 3
 MAX_FILE_DELAY_S = 7
-MONTHLY_LIMIT_GB = 180000000000000000000000
 
 # --- 数据库与状态文件路径 ---
 ASN_BLOCKS_DB_PATH = 'GeoLite2-ASN-Blocks-IPv4.csv'
 COUNTRY_BLOCKS_DB_PATH = 'GeoLite2-Country-Blocks-IPv4.csv'
 COUNTRY_LOCATIONS_DB_PATH = 'GeoLite2-Country-Locations-en.csv'
-STATE_FILE_PATH = 'dandelion_state.json'
 ASN_EXCLUSION_LIST = []
 
 # --- 线程与数据包配置 ---
@@ -93,7 +99,6 @@ DEFAULT_SOURCE_DIRECTORY = BASE_DIRECTORY
 # --- 全局控制变量 ---
 EXIT_FLAG = threading.Event()
 GLOBAL_COUNTRY_POOL = []
-state_lock = threading.Lock()
 active_threads = []
 hotspot_broadcaster = None # 用于安全关闭
 source_dirs_lock = threading.Lock()
@@ -104,10 +109,6 @@ params_lock = threading.Lock()
 CURRENT_IP_BATCH_SIZE = 10
 CURRENT_DELAY_BETWEEN_BATCHES_S = 0.5
 CURRENT_TARGET_WORKERS = 2
-
-# --- 流量追踪 (线程安全) ---
-session_total_bytes_sent = 0
-session_bytes_lock = threading.Lock()
 
 # --- 5G热点状态跟踪 ---
 HOTSPOT_STATUS = {'active': False, 'files_broadcast': 0, 'bytes_transmitted': 0}
@@ -445,7 +446,6 @@ class StatusDisplayThread(threading.Thread):
         win.addstr(y, x, " " * (w - 1), curses.color_pair(2))
         title = " 全球蒲公英 (引擎: 定时调速) | 按 'q' 退出 "
         win.addstr(y, x + (w - len(title)) // 2, title, curses.color_pair(2) | curses.A_BOLD)
-        traffic_str = '本月已发送: {:.4f} GB'.format(load_state().get('total_sent_gb', 0))
         queue_str = '任务队列 (WAN/LAN): {}/{}'.format(WAN_TASK_QUEUE.qsize(), LAN_TASK_QUEUE.qsize())
         with HOTSPOT_LOCK:
             hotspot_str = '5G热点: {} | 已广播: {} 文件 {:.2f}MB'.format(
@@ -453,7 +453,7 @@ class StatusDisplayThread(threading.Thread):
                 HOTSPOT_STATUS['files_broadcast'],
                 HOTSPOT_STATUS['bytes_transmitted'] / (1024*1024)
             )
-        win.addstr(y + 2, x + 2, '{:<40} {:<40}'.format(traffic_str, queue_str))
+        win.addstr(y + 2, x + 2, queue_str)
         win.addstr(y + 3, x + 2, hotspot_str)
     def draw_status_table(self, win, y, x, h, w):
         header = '{:<25} | {:<35} | {:<22} | {}'.format('线程名称', '当前文件', '进度', '详情')
@@ -566,9 +566,7 @@ class ChunkSenderWorker(threading.Thread):
                 packet, filename, total_size, current_pos = self.task_queue.get(timeout=1)
                 progress = (current_pos / total_size) * 100 if total_size > 0 else 0
                 with STATUS_LOCK: WORKER_STATUS[self.name] = {"file": filename, "mode": "WAN发送", "progress": '{:.1f}%'.format(progress), "details": "发送中..."}
-                bytes_sent = send_chunk_in_batches(self.udp_socket, packet, self.target_ip_pool)
-                if bytes_sent > 0:
-                    with session_bytes_lock: global session_total_bytes_sent; session_total_bytes_sent += bytes_sent
+                send_chunk_in_batches(self.udp_socket, packet, self.target_ip_pool)
                 self.task_queue.task_done()
             except queue.Empty:
                 with STATUS_LOCK: WORKER_STATUS[self.name] = {"file": "N/A", "mode": "空闲", "progress": "---", "details": "等待任务"}
@@ -606,26 +604,6 @@ def graceful_shutdown(signum, frame):
     if EXIT_FLAG.is_set(): return
     log_message('\n[*] 收到终止信号 {}. 准备安全退出...'.format(signum))
     EXIT_FLAG.set()
-
-def load_state():
-    state_path = os.path.join(BASE_DIRECTORY, STATE_FILE_PATH)
-    current_month_str = datetime.now().strftime("%Y-%m")
-    try:
-        with state_lock, open(state_path, 'r') as f:
-            state = json.load(f)
-        if state.get('current_month') != current_month_str:
-            log_message("[*] 检测到新的月份。重置流量计数器。")
-            state = {'current_month': current_month_str, 'total_sent_gb': 0.0}
-            save_state(state)
-        return state
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {'current_month': current_month_str, 'total_sent_gb': 0.0}
-
-def save_state(state):
-    state_path = os.path.join(BASE_DIRECTORY, STATE_FILE_PATH)
-    try:
-        with state_lock, open(state_path, 'w') as f: json.dump(state, f, indent=4)
-    except Exception as e: log_message('[!] 严重错误: 无法保存状态文件: {}'.format(e))
 
 def generate_ip_from_cidr(cidr_str):
     try:
@@ -665,7 +643,12 @@ def main():
 
     log_message("[*] 欢迎使用全球蒲公英。正在初始化...")
 
-    files_to_exclude = {os.path.basename(__file__), STATE_FILE_PATH}
+    files_to_exclude = {
+        os.path.basename(__file__),
+        ASN_BLOCKS_DB_PATH,
+        COUNTRY_BLOCKS_DB_PATH,
+        COUNTRY_LOCATIONS_DB_PATH,
+    }
     
     try:
         global_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -710,3 +693,4 @@ if __name__ == "__main__":
             traceback.print_exc()
     finally:
         print("\n[*] 程序执行完毕。")
+
