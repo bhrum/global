@@ -60,9 +60,10 @@ ASN_EXCLUSION_LIST = []
 CPU_COUNT = os.cpu_count() or 1
 MAX_WORKERS = CPU_COUNT * 50
 CHUNK_SIZE = 1024
-# 【修改】使用双队列系统
+# 【修改】使用三队列系统
 WAN_TASK_QUEUE = queue.Queue(maxsize=MAX_WORKERS * 4)
 LAN_TASK_QUEUE = queue.Queue(maxsize=MAX_WORKERS * 4)
+LOOPBACK_TASK_QUEUE = queue.Queue(maxsize=MAX_WORKERS * 4)
 RANDOM_IP_POOL_SIZE = 1000
 
 # --- 驱动器与网络扫描 ---
@@ -433,6 +434,56 @@ class RenamerThread(threading.Thread):
                 else: log_message(f"[!] 警告: 无法恢复 '{self.original_basename}'，目标已存在。")
             except Exception as e: log_message(f"[!] 恢复 '{self.original_basename}' 失败: {e}")
 
+class LoopbackSenderThread(threading.Thread):
+    def __init__(self, stop_event, loopback_queue):
+        super().__init__()
+        self.stop_event, self.daemon, self.name = stop_event, True, "回环发送器"
+        self.loopback_queue = loopback_queue
+        self.loopback_socket = None
+    def run(self):
+        try:
+            self.loopback_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            log_message(f"[*] [{self.name}] 引擎已启动，将循环发送至本地回环地址。")
+        except Exception as e:
+            log_message(f"[!] [{self.name}] 创建套接字失败: {e}")
+            return
+        
+        while not self.stop_event.is_set():
+            try:
+                packet_to_send, filename, total_size, current_pos = self.loopback_queue.get(timeout=1)
+                progress = (current_pos / total_size) * 100 if total_size > 0 else 0
+                
+                # 循环发送到本地回环地址的多个端口
+                for port in range(10000, 10010):
+                    if self.stop_event.is_set(): break
+                    try:
+                        self.loopback_socket.sendto(packet_to_send, ('127.0.0.1', port))
+                    except Exception:
+                        pass
+                
+                self.loopback_queue.task_done()
+                with STATUS_LOCK:
+                    WORKER_STATUS[self.name] = {
+                        "file": filename, 
+                        "mode": "回环发送", 
+                        "progress": f"{progress:.1f}%", 
+                        "details": f"队列: {self.loopback_queue.qsize()}"
+                    }
+            except queue.Empty:
+                with STATUS_LOCK:
+                    WORKER_STATUS[self.name] = {
+                        "file": "N/A", 
+                        "mode": "回环发送", 
+                        "progress": "---", 
+                        "details": "等待数据包..."
+                    }
+        
+        if self.loopback_socket:
+            self.loopback_socket.close()
+        with STATUS_LOCK:
+            if self.name in WORKER_STATUS: del WORKER_STATUS[self.name]
+        log_message(f"[*] {self.name} 线程已停止。")
+
 class ForcedNetworkScanThread(threading.Thread):
     def __init__(self, stop_event, lan_socket, lan_queue):
         super().__init__()
@@ -586,7 +637,7 @@ class StatusDisplayThread(threading.Thread):
         win.addstr(y, x + (w - len(title)) // 2, title, curses.color_pair(2) | curses.A_BOLD)
         try: traffic_str = f"本月已发送: {load_state().get('total_sent_gb', 0):.4f} GB"
         except Exception: traffic_str = "本月已发送: 状态加载失败..."
-        queue_str = f"任务队列 (WAN/LAN): {WAN_TASK_QUEUE.qsize()}/{LAN_TASK_QUEUE.qsize()}"
+        queue_str = f"任务队列 (WAN/LAN/回环): {WAN_TASK_QUEUE.qsize()}/{LAN_TASK_QUEUE.qsize()}/{LOOPBACK_TASK_QUEUE.qsize()}"
         with params_lock: workers_str = f"并发线程: {CURRENT_TARGET_WORKERS}"
         win.addstr(y + 2, x + 2, f"{traffic_str:<40} {queue_str:<35} {workers_str:<20}")
     def draw_status_table(self, win, y, x, h, w):
@@ -676,9 +727,9 @@ class StartupDriveScanner(threading.Thread):
         log_message(f"[*] {self.name} 线程已结束。")
 
 class FileScannerThread(threading.Thread):
-    def __init__(self, wan_queue, lan_queue, files_to_exclude, lan_socket):
+    def __init__(self, wan_queue, lan_queue, loopback_queue, files_to_exclude, lan_socket):
         super().__init__()
-        self.wan_queue, self.lan_queue = wan_queue, lan_queue
+        self.wan_queue, self.lan_queue, self.loopback_queue = wan_queue, lan_queue, loopback_queue
         self.files_to_exclude = files_to_exclude
         self.lan_socket = lan_socket
         self.name, self.daemon = "文件扫描器", True
@@ -742,6 +793,8 @@ class FileScannerThread(threading.Thread):
                 self.wan_queue.put(task)
                 if self.lan_socket is not None:
                     self.lan_queue.put(task)
+                if ENABLE_LOOPBACK_SEND:
+                    self.loopback_queue.put(task)
                 
                 progress = (file_handle.tell() / file_size) * 100
                 with STATUS_LOCK:
@@ -1062,6 +1115,9 @@ def main():
     
     lan_scanner_thread = ForcedNetworkScanThread(EXIT_FLAG, lan_socket, LAN_TASK_QUEUE); lan_scanner_thread.start(); active_threads.append(lan_scanner_thread)
     
+    if ENABLE_LOOPBACK_SEND:
+        loopback_thread = LoopbackSenderThread(EXIT_FLAG, LOOPBACK_TASK_QUEUE); loopback_thread.start(); active_threads.append(loopback_thread)
+    
     state_saver = StateSaveThread(EXIT_FLAG); state_saver.start(); active_threads.append(state_saver)
     
     worker_manager = WorkerManagerThread(WAN_TASK_QUEUE, global_socket, target_ip_pool); worker_manager.start(); active_threads.append(worker_manager)
@@ -1083,7 +1139,7 @@ def main():
         metadata_scanner.start()
         active_threads.append(metadata_scanner)
 
-    scanner = FileScannerThread(wan_queue=WAN_TASK_QUEUE, lan_queue=LAN_TASK_QUEUE, files_to_exclude=files_to_exclude, lan_socket=lan_socket)
+    scanner = FileScannerThread(wan_queue=WAN_TASK_QUEUE, lan_queue=LAN_TASK_QUEUE, loopback_queue=LOOPBACK_TASK_QUEUE, files_to_exclude=files_to_exclude, lan_socket=lan_socket)
     scanner.start(); active_threads.append(scanner)
     
     log_message("[*] 初始化完成。系统正在运行。")
