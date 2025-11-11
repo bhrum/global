@@ -43,7 +43,18 @@ fi
 echo "找到 ${#SOURCE_FILES[@]} 个文件待复制"
 echo "-----------------------------------------------------"
 
-# 5. 循环复制，逐个文件尝试，直到最小的文件也无法复制
+# 5. 检查剩余空间，如果所有文件都大于剩余空间则退出
+CURRENT_AVAILABLE_SPACE=$(df --output=avail -B1 "$SCRIPT_DIR" | tail -n 1)
+SMALLEST_FILE="${SOURCE_FILES[-1]}"
+SMALLEST_SIZE=$(stat -c%s "$SMALLEST_FILE" 2>/dev/null || stat -f%z "$SMALLEST_FILE" 2>/dev/null)
+
+if [ "$CURRENT_AVAILABLE_SPACE" -le "$SMALLEST_SIZE" ]; then
+    echo "空间不足: 剩余 $(numfmt --to=iec-i --suffix=B $CURRENT_AVAILABLE_SPACE 2>/dev/null || echo "$CURRENT_AVAILABLE_SPACE 字节")，所有文件都无法复制（最小文件: $(numfmt --to=iec-i --suffix=B $SMALLEST_SIZE 2>/dev/null || echo "$SMALLEST_SIZE 字节")）。"
+    echo "脚本退出。"
+    exit 0
+fi
+
+# 6. 循环复制，逐个文件尝试，直到最小的文件也无法复制
 COPY_COUNT=0
 FILE_INDEX=0
 
