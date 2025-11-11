@@ -67,12 +67,17 @@ while true; do
     FILE_SIZE=$(stat -c%s "$CURRENT_FILE" 2>/dev/null || stat -f%z "$CURRENT_FILE" 2>/dev/null)
     
     if [ "$CURRENT_AVAILABLE_SPACE" -gt "$FILE_SIZE" ]; then
-        # 空间足够，复制文件
-        COPY_COUNT=$((COPY_COUNT + 1))
+        # 空间足够，尝试复制文件
         FILENAME=$(basename "$CURRENT_FILE")
-        echo "[$COPY_COUNT] 复制: $FILENAME ($(numfmt --to=iec-i --suffix=B $FILE_SIZE 2>/dev/null || echo "$FILE_SIZE 字节")) | 剩余空间: $(numfmt --to=iec-i --suffix=B $CURRENT_AVAILABLE_SPACE 2>/dev/null || echo "$CURRENT_AVAILABLE_SPACE 字节")"
         
-        cp --reflink=never --backup=numbered "$CURRENT_FILE" "$DEST_DIR/" 2>/dev/null
+        if cp --reflink=never --backup=numbered "$CURRENT_FILE" "$DEST_DIR/" 2>/dev/null; then
+            COPY_COUNT=$((COPY_COUNT + 1))
+            echo "[$COPY_COUNT] 复制: $FILENAME ($(numfmt --to=iec-i --suffix=B $FILE_SIZE 2>/dev/null || echo "$FILE_SIZE 字节")) | 剩余空间: $(numfmt --to=iec-i --suffix=B $CURRENT_AVAILABLE_SPACE 2>/dev/null || echo "$CURRENT_AVAILABLE_SPACE 字节")"
+        else
+            echo "-----------------------------------------------------"
+            echo "复制失败: 磁盘空间已满或发生错误。"
+            break
+        fi
         
         # 移动到下一个文件（循环回到开始）
         FILE_INDEX=$(( (FILE_INDEX + 1) % ${#SOURCE_FILES[@]} ))
