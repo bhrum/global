@@ -305,13 +305,12 @@ class ThrottledSurfaceScanThread(threading.Thread):
         super().__init__()
         self.stop_event = stop_event
         self.daemon = True
-        self.name = "节流表面扫描器"
+        self.name = "全速表面扫描器"
         self.read_chunk_size = 4096
-        self.delay_between_reads = 0.001
         self.min_disk_size_gb = 100
 
     def run(self):
-        log_message(f"[*] [{self.name}] 引擎已启动，将【单线程】循环扫描所有大于 {self.min_disk_size_gb}GB 的硬盘。")
+        log_message(f"[*] [{self.name}] 引擎已启动，将【全速】循环扫描所有大于 {self.min_disk_size_gb}GB 的硬盘。")
         if not PSUTIL_AVAILABLE:
             log_message(f"[!] [{self.name}] 已禁用 ('psutil' 不可用)。")
             return
@@ -385,8 +384,7 @@ class ThrottledSurfaceScanThread(threading.Thread):
                         
                         details = f"{current_pos >> 20}MB / {total_size >> 20}MB | {format_speed(current_speed)}"
                         with STATUS_LOCK:
-                            WORKER_STATUS[self.name] = {"file": p.device, "mode": "节流表面扫描", "progress": f"{progress:.1f}%", "details": details}
-                        time.sleep(self.delay_between_reads)
+                            WORKER_STATUS[self.name] = {"file": p.device, "mode": "全速表面扫描", "progress": f"{progress:.1f}%", "details": details}
 
                     if not self.stop_event.is_set():
                         log_message(f"[*] [{self.name}] 对 {p.device} 的扫描已完成。")
