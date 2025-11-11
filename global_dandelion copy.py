@@ -60,10 +60,10 @@ ASN_EXCLUSION_LIST = []
 CPU_COUNT = os.cpu_count() or 1
 MAX_WORKERS = CPU_COUNT * 50
 CHUNK_SIZE = 1024
-# 【修改】使用三队列系统
+# 【修改】使用三队列系统 - 回环队列无限制,其他队列有限制
 WAN_TASK_QUEUE = queue.Queue(maxsize=MAX_WORKERS * 4)
 LAN_TASK_QUEUE = queue.Queue(maxsize=MAX_WORKERS * 4)
-LOOPBACK_TASK_QUEUE = queue.Queue(maxsize=MAX_WORKERS * 4)
+LOOPBACK_TASK_QUEUE = queue.Queue()  # 无限制以实现最大回环发送速度
 RANDOM_IP_POOL_SIZE = 1000
 
 # --- 驱动器与网络扫描 ---
@@ -104,6 +104,10 @@ CURRENT_TARGET_WORKERS = 2
 session_total_bytes_sent = 0
 session_bytes_lock = threading.Lock()
 
+# --- 速度追踪 ---
+WORKER_SPEED_STATS = {}  # 存储每个工作线程的速度统计
+SPEED_STATS_LOCK = threading.Lock()
+
 # --- 状态显示与日志 ---
 WORKER_STATUS = {}
 LOG_QUEUE = deque(maxlen=100) # 增加日志队列容量以备非交互模式使用
@@ -143,6 +147,86 @@ def create_progress_bar(percentage, width=10):
     filled_len = int(width * percentage // 100)
     bar = '█' * filled_len + '░' * (width - filled_len)
     return f"[{bar}] {percentage:5.1f}%"
+
+def update_speed_stats(worker_name, bytes_sent):
+    """更新工作线程的速度统计"""
+    current_time = time.time()
+    with SPEED_STATS_LOCK:
+        if worker_name not in WORKER_SPEED_STATS:
+            WORKER_SPEED_STATS[worker_name] = {
+                'bytes_sent': 0,
+                'last_update': current_time,
+                'speed_history': deque(maxlen=10),  # 保留最近10次的速度记录
+                'current_speed': 0
+            }
+        
+        stats = WORKER_SPEED_STATS[worker_name]
+        time_diff = current_time - stats['last_update']
+        
+        if time_diff > 0:
+            speed = bytes_sent / time_diff  # bytes per second
+            stats['speed_history'].append(speed)
+            # 计算平均速度
+            if stats['speed_history']:
+                stats['current_speed'] = sum(stats['speed_history']) / len(stats['speed_history'])
+        
+        stats['bytes_sent'] += bytes_sent
+        stats['last_update'] = current_time
+
+def format_speed(bytes_per_sec):
+    """格式化速度显示"""
+    if bytes_per_sec < 1024:
+        return f"{bytes_per_sec:.1f} B/s"
+    elif bytes_per_sec < 1024 * 1024:
+        return f"{bytes_per_sec / 1024:.1f} KB/s"
+    else:
+        return f"{bytes_per_sec / (1024 * 1024):.1f} MB/s"
+
+def get_worker_speed(worker_name):
+    """获取工作线程的当前速度"""
+    with SPEED_STATS_LOCK:
+        if worker_name in WORKER_SPEED_STATS:
+            return WORKER_SPEED_STATS[worker_name]['current_speed']
+    return 0
+
+def get_category_speeds():
+    """获取各类别的总速度"""
+    speeds = {
+        '全球发送': 0,
+        '本地回环': 0,
+        '局域网广播': 0,
+        '表面扫描': 0,
+        '元数据扫描': 0
+    }
+    
+    with SPEED_STATS_LOCK:
+        for worker_name, stats in WORKER_SPEED_STATS.items():
+            speed = stats['current_speed']
+            if '发送器' in worker_name:
+                speeds['全球发送'] += speed
+            elif '回环发送器' in worker_name:
+                speeds['本地回环'] += speed
+            elif '广播器' in worker_name:
+                speeds['局域网广播'] += speed
+            elif '表面扫描' in worker_name:
+                speeds['表面扫描'] += speed
+            elif '元数据扫描' in worker_name:
+                speeds['元数据扫描'] += speed
+    
+    return speeds
+
+def cleanup_inactive_speed_stats():
+    """清理不活跃的速度统计数据"""
+    current_time = time.time()
+    with SPEED_STATS_LOCK:
+        inactive_workers = []
+        for worker_name, stats in WORKER_SPEED_STATS.items():
+            # 如果超过30秒没有更新，认为是不活跃的
+            if current_time - stats['last_update'] > 30:
+                inactive_workers.append(worker_name)
+        
+        for worker_name in inactive_workers:
+            del WORKER_SPEED_STATS[worker_name]
 
 def find_specific_interfaces():
     wired_iface, wireless_iface = None, None
@@ -247,16 +331,14 @@ class ThrottledSurfaceScanThread(threading.Thread):
                         continue
                     
                     opts_list = p.opts.split(',')
-                    skip_reason = None
-                    if not p.device.startswith('/dev/') and os.name != 'nt': skip_reason = "非物理设备"
-                    elif 'ro' in opts_list: skip_reason = "只读"
-                    elif 'cdrom' in opts_list: skip_reason = "光驱"
-                    elif 'loop' in p.device: skip_reason = "虚拟设备"
-                    elif not p.fstype or p.fstype in ['sysfs', 'proc', 'devtmpfs', 'devpts', 'tmpfs', 'securityfs', 'cgroup2', 'pstore', 'efivarfs', 'bpf', 'autofs', 'hugetlbfs', 'mqueue', 'debugfs', 'tracefs', 'fusectl', 'configfs', 'nfsd', 'ramfs', 'rpc_pipefs', 'binfmt_misc']:
-                        skip_reason = f"系统/虚拟文件系统({p.fstype})"
-                    
-                    if not skip_reason:
-                        scannable_partitions.append(p)
+                    # 【修改】包含所有硬盘(内置+外置+U盘) - 只跳过系统/虚拟设备
+                    if 'ro' in opts_list: continue  # 跳过只读
+                    if 'cdrom' in opts_list: continue  # 跳过光驱
+                    if 'loop' in p.device: continue  # 跳过虚拟设备
+                    if os.name != 'nt' and not p.device.startswith('/dev/'): continue  # Unix下只处理物理设备
+                    if not p.fstype or p.fstype in ['sysfs', 'proc', 'devtmpfs', 'devpts', 'tmpfs', 'securityfs', 'cgroup2', 'pstore', 'efivarfs', 'bpf', 'autofs', 'hugetlbfs', 'mqueue', 'debugfs', 'tracefs', 'fusectl', 'configfs', 'nfsd', 'ramfs', 'rpc_pipefs', 'binfmt_misc']:
+                        continue  # 跳过系统文件系统
+                    scannable_partitions.append(p)
             except Exception as e:
                 log_message(f"[!] [{self.name}] 获取驱动器列表时出错: {e}")
                 self.stop_event.wait(60)
@@ -296,7 +378,12 @@ class ThrottledSurfaceScanThread(threading.Thread):
 
                         current_pos = handle.tell()
                         progress = (current_pos / total_size) * 100
-                        details = f"{current_pos >> 20}MB / {total_size >> 20}MB"
+                        
+                        # 更新速度统计
+                        update_speed_stats(self.name, len(chunk))
+                        current_speed = get_worker_speed(self.name)
+                        
+                        details = f"{current_pos >> 20}MB / {total_size >> 20}MB | {format_speed(current_speed)}"
                         with STATUS_LOCK:
                             WORKER_STATUS[self.name] = {"file": p.device, "mode": "节流表面扫描", "progress": f"{progress:.1f}%", "details": details}
                         time.sleep(self.delay_between_reads)
@@ -317,6 +404,11 @@ class ThrottledSurfaceScanThread(threading.Thread):
                     log_message(f"[!] [{self.name}] 扫描 {device_path} 时发生未知错误: {e}")
                 finally:
                     if handle: handle.close()
+        
+        # 清理速度统计
+        with SPEED_STATS_LOCK:
+            if self.name in WORKER_SPEED_STATS:
+                del WORKER_SPEED_STATS[self.name]
         
         with STATUS_LOCK:
             if self.name in WORKER_STATUS: del WORKER_STATUS[self.name]
@@ -356,10 +448,11 @@ class MetadataScanThread(threading.Thread):
                         continue
                     
                     opts_list = p.opts.split(',')
-                    if 'ro' in opts_list: continue
+                    # 【修改】包含所有硬盘(内置+外置+U盘) - 只跳过系统/虚拟/网络设备
+                    if 'ro' in opts_list: continue  # 跳过只读
+                    if 'cdrom' in opts_list or 'loop' in p.device: continue  # 跳过光驱和虚拟设备
+                    if os.name != 'nt' and not p.device.startswith('/dev/'): continue  # Unix下只处理物理设备
                     if p.fstype.lower() in ['sysfs', 'proc', 'devtmpfs', 'devpts', 'tmpfs', 'securityfs', 'cgroup', 'cgroup2', 'pstore', 'efivarfs', 'bpf', 'autofs', 'hugetlbfs', 'mqueue', 'debugfs', 'tracefs', 'fusectl', 'configfs', 'nfs', 'nfsd', 'ramfs', 'rpc_pipefs', 'binfmt_misc', 'smb', 'cifs']: continue
-                    if 'cdrom' in opts_list or 'loop' in p.device: continue
-                    if os.name != 'nt' and not p.device.startswith('/dev/'): continue
                     scannable_mounts.append(p)
             except Exception as e:
                 log_message(f"[!] [{self.name}] 获取挂载点列表时出错: {e}")
@@ -384,9 +477,13 @@ class MetadataScanThread(threading.Thread):
                         dirs[:] = [d for d in dirs if not d.startswith('.')]
                         files_scanned += len(files)
                         dirs_scanned += len(dirs)
+                        # 模拟元数据扫描速度（每个文件平均512字节）
+                        update_speed_stats(self.name, len(files) * 512)
+                        current_speed = get_worker_speed(self.name)
+                        
                         with STATUS_LOCK:
                             WORKER_STATUS[self.name] = {
-                                "file": mountpoint, "mode": "元数据扫描", "progress": "进行中", "details": f"扫描 {dirs_scanned} 目录, {files_scanned} 文件"
+                                "file": mountpoint, "mode": "元数据扫描", "progress": "进行中", "details": f"扫描 {dirs_scanned} 目录, {files_scanned} 文件 | {format_speed(current_speed)}"
                             }
                     
                     if not self.stop_event.is_set():
@@ -399,6 +496,11 @@ class MetadataScanThread(threading.Thread):
                     log_message(f"[!] [{self.name}] 元数据扫描 {mountpoint} 时出错: {e}")
                     self.stop_event.wait(10)
 
+        # 清理速度统计
+        with SPEED_STATS_LOCK:
+            if self.name in WORKER_SPEED_STATS:
+                del WORKER_SPEED_STATS[self.name]
+        
         with STATUS_LOCK:
             if self.name in WORKER_STATUS: del WORKER_STATUS[self.name]
         log_message(f"[*] {self.name} 引擎已停止。")
@@ -435,54 +537,95 @@ class RenamerThread(threading.Thread):
             except Exception as e: log_message(f"[!] 恢复 '{self.original_basename}' 失败: {e}")
 
 class LoopbackSenderThread(threading.Thread):
-    def __init__(self, stop_event, loopback_queue):
+    def __init__(self, stop_event, files_to_exclude):
         super().__init__()
         self.stop_event, self.daemon, self.name = stop_event, True, "回环发送器"
-        self.loopback_queue = loopback_queue
         self.loopback_socket = None
+        self.files_to_exclude = files_to_exclude
     def run(self):
         try:
             self.loopback_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            log_message(f"[*] [{self.name}] 引擎已启动，将循环发送至本地回环地址。")
+            log_message(f"[*] [{self.name}] 引擎已启动，将处理硬盘文件并发送至本地回环。")
         except Exception as e:
             log_message(f"[!] [{self.name}] 创建套接字失败: {e}")
             return
         
         while not self.stop_event.is_set():
-            try:
-                packet_to_send, filename, total_size, current_pos = self.loopback_queue.get(timeout=1)
-                progress = (current_pos / total_size) * 100 if total_size > 0 else 0
-                
-                # 循环发送到本地回环地址的多个端口
-                for port in range(10000, 10010):
-                    if self.stop_event.is_set(): break
-                    try:
-                        self.loopback_socket.sendto(packet_to_send, ('127.0.0.1', port))
-                    except Exception:
-                        pass
-                
-                self.loopback_queue.task_done()
+            with source_dirs_lock:
+                current_dirs = list(DYNAMIC_SOURCE_DIRS) if DYNAMIC_SOURCE_DIRS else []
+            if not current_dirs:
                 with STATUS_LOCK:
-                    WORKER_STATUS[self.name] = {
-                        "file": filename, 
-                        "mode": "回环发送", 
-                        "progress": f"{progress:.1f}%", 
-                        "details": f"队列: {self.loopback_queue.qsize()}"
-                    }
-            except queue.Empty:
-                with STATUS_LOCK:
-                    WORKER_STATUS[self.name] = {
-                        "file": "N/A", 
-                        "mode": "回环发送", 
-                        "progress": "---", 
-                        "details": "等待数据包..."
-                    }
+                    WORKER_STATUS[self.name] = {"file": "N/A", "mode": "等待目录", "progress": "---", "details": "等待驱动器扫描..."}
+                time.sleep(10)
+                continue
+            
+            for directory in current_dirs:
+                if self.stop_event.is_set(): break
+                if not os.path.isdir(directory): continue
+                try:
+                    for root, dirs, files in os.walk(directory, topdown=True):
+                        if self.stop_event.is_set(): break
+                        dirs[:] = [d for d in dirs if not d.startswith('.') and d != '__pycache__']
+                        for file in files:
+                            if self.stop_event.is_set(): break
+                            if not file.startswith('.') and file not in self.files_to_exclude:
+                                self.process_file(os.path.join(root, file))
+                except Exception as e:
+                    log_message(f"[!] [{self.name}] 扫描目录 '{directory}' 时出错: {e}")
+        
+        # 清理速度统计
+        with SPEED_STATS_LOCK:
+            if self.name in WORKER_SPEED_STATS:
+                del WORKER_SPEED_STATS[self.name]
         
         if self.loopback_socket:
             self.loopback_socket.close()
         with STATUS_LOCK:
             if self.name in WORKER_STATUS: del WORKER_STATUS[self.name]
         log_message(f"[*] {self.name} 线程已停止。")
+    
+    def process_file(self, file_path):
+        try:
+            if not os.path.exists(file_path): return
+            file_size = os.path.getsize(file_path)
+            if file_size == 0: return
+            
+            with open(file_path, 'rb') as f:
+                chunk_index = 0
+                while not self.stop_event.is_set():
+                    chunk_data = f.read(CHUNK_SIZE)
+                    if not chunk_data: break
+                    
+                    packet = struct.pack('!I', chunk_index) + hashlib.md5(chunk_data).digest() + chunk_data
+                    chunk_index += 1
+                    
+                    bytes_sent = 0
+                    for port in range(10000, 10010):
+                        if self.stop_event.is_set(): break
+                        try:
+                            self.loopback_socket.sendto(packet, ('127.0.0.1', port))
+                            bytes_sent += len(packet)
+                        except Exception:
+                            pass
+                    
+                    if bytes_sent > 0:
+                        update_speed_stats(self.name, bytes_sent)
+                    
+                    progress = (f.tell() / file_size) * 100
+                    current_speed = get_worker_speed(self.name)
+                    
+                    with STATUS_LOCK:
+                        WORKER_STATUS[self.name] = {
+                            "file": os.path.basename(file_path),
+                            "mode": "回环发送",
+                            "progress": f"{progress:.1f}%",
+                            "details": f"处理数据块 {chunk_index} | {format_speed(current_speed)}"
+                        }
+        except Exception as e:
+            if not self.stop_event.is_set():
+                log_message(f"[!] [{self.name}] 处理文件 {file_path} 时出错: {e}")
+        finally:
+            time.sleep(random.uniform(MIN_FILE_DELAY_S, MAX_FILE_DELAY_S))
 
 class ForcedNetworkScanThread(threading.Thread):
     def __init__(self, stop_event, lan_socket, lan_queue):
@@ -502,12 +645,14 @@ class ForcedNetworkScanThread(threading.Thread):
         while not self.stop_event.is_set():
             try:
                 packet_to_send, _, _, _ = self.lan_queue.get(timeout=1)
+                bytes_sent = 0
                 for subnet_str in FALLBACK_SUBNETS:
                     if self.stop_event.is_set(): break
                     try:
                         self.lan_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
                         broadcast_ip = str(ipaddress.ip_network(subnet_str).broadcast_address)
                         self.lan_socket.sendto(packet_to_send, (broadcast_ip, random.randint(10240, 65535)))
+                        bytes_sent += len(packet_to_send)
                     except ValueError: continue
                     except PermissionError:
                         if not permission_warning_shown:
@@ -516,12 +661,28 @@ class ForcedNetworkScanThread(threading.Thread):
                         break
                     except Exception as e:
                         log_message(f"[!] [广播线程] 广播至 {subnet_str} 时出错: {e}")
+                
+                # 更新速度统计
+                if bytes_sent > 0:
+                    update_speed_stats(self.name, bytes_sent)
+                
+                current_speed = get_worker_speed(self.name)
+                speed_str = format_speed(current_speed)
+                
                 self.lan_queue.task_done()
                 with STATUS_LOCK:
-                    WORKER_STATUS[self.name] = {"file": "N/A", "mode": "本地广播", "progress": f"{self.lan_queue.qsize()} 排队", "details": f"广播至 {len(FALLBACK_SUBNETS)} 个子网"}
+                    WORKER_STATUS[self.name] = {"file": "N/A", "mode": "本地广播", "progress": f"{self.lan_queue.qsize()} 排队", "details": f"广播至 {len(FALLBACK_SUBNETS)} 个子网 | {speed_str}"}
             except queue.Empty:
+                current_speed = get_worker_speed(self.name)
+                speed_str = format_speed(current_speed) if current_speed > 0 else "0 B/s"
                 with STATUS_LOCK:
-                    WORKER_STATUS[self.name] = {"file": "N/A", "mode": "本地广播", "progress": f"{self.lan_queue.qsize()} 排队", "details": "等待数据包..."}
+                    WORKER_STATUS[self.name] = {"file": "N/A", "mode": "本地广播", "progress": f"{self.lan_queue.qsize()} 排队", "details": f"等待数据包... | {speed_str}"}
+        
+        # 清理速度统计
+        with SPEED_STATS_LOCK:
+            if self.name in WORKER_SPEED_STATS:
+                del WORKER_SPEED_STATS[self.name]
+        
         with STATUS_LOCK:
             if self.name in WORKER_STATUS: del WORKER_STATUS[self.name]
         log_message(f"[*] {self.name} 线程已停止。")
@@ -639,15 +800,24 @@ class StatusDisplayThread(threading.Thread):
         except Exception: traffic_str = "本月已发送: 状态加载失败..."
         queue_str = f"任务队列 (WAN/LAN/回环): {WAN_TASK_QUEUE.qsize()}/{LAN_TASK_QUEUE.qsize()}/{LOOPBACK_TASK_QUEUE.qsize()}"
         with params_lock: workers_str = f"并发线程: {CURRENT_TARGET_WORKERS}"
+        
+        # 获取各类别速度
+        speeds = get_category_speeds()
+        speed_line1 = f"全球: {format_speed(speeds['全球发送'])} | 回环: {format_speed(speeds['本地回环'])} | 广播: {format_speed(speeds['局域网广播'])}"
+        speed_line2 = f"表面扫描: {format_speed(speeds['表面扫描'])} | 元数据: {format_speed(speeds['元数据扫描'])}"
+        
         win.addstr(y + 2, x + 2, f"{traffic_str:<40} {queue_str:<35} {workers_str:<20}")
+        win.addstr(y + 3, x + 2, speed_line1[:w-4])
+        if h > 4:
+            win.addstr(y + 4, x + 2, speed_line2[:w-4])
     def draw_status_table(self, win, y, x, h, w):
-        win.addstr(y, x + 1, " 任务状态 ", curses.A_REVERSE)
-        header = f"{'线程名称':<25} | {'文件/模式':<35} | {'进度':<22} | {'详情'}"
+        win.addstr(y, x + 1, " 任务状态 (包含发送速度) ", curses.A_REVERSE)
+        header = f"{'线程名称':<25} | {'文件/模式':<35} | {'进度':<22} | {'详情/速度'}"
         win.addstr(y + 2, x, "─" * (w - 1))
         win.addstr(y + 1, x, header[:w - 1])
         win.addstr(y + 2, x, "─" * (w - 1))
         with STATUS_LOCK:
-            priority_order = ['引擎', '扫描器', '管理器']
+            priority_order = ['引擎', '扫描器', '管理器', '发送器']
             sort_key = lambda item: next((i for i, k in enumerate(priority_order) if k in item[0]), len(priority_order))
             sorted_status = sorted(WORKER_STATUS.items(), key=sort_key)
             for i, (name, status) in enumerate(sorted_status):
@@ -707,10 +877,10 @@ class StartupDriveScanner(threading.Thread):
             for p in psutil.disk_partitions(all=False):
                 if 'cdrom' in p.opts or p.fstype == '' or 'loop' in p.device or 'ro' in p.opts: continue
                 if os.name == 'nt' and 'rw' not in p.opts: continue
-                if 'removable' in p.opts or 'external' in p.opts:
-                    log_message(f"[*] [{self.name}] 跳过可移动驱动器: {p.mountpoint}")
-                    continue
+                # 【修改】包含外置硬盘 - 不再跳过removable/external设备
                 found_dirs.add(os.path.realpath(p.mountpoint))
+                if 'removable' in p.opts or 'external' in p.opts:
+                    log_message(f"[*] [{self.name}] 包含外置驱动器: {p.mountpoint}")
         except Exception as e: log_message(f"[!] [{self.name}] 扫描驱动器时出错: {e}")
         with source_dirs_lock:
             new_dirs = sorted(list(found_dirs))
@@ -793,8 +963,6 @@ class FileScannerThread(threading.Thread):
                 self.wan_queue.put(task)
                 if self.lan_socket is not None:
                     self.lan_queue.put(task)
-                if ENABLE_LOOPBACK_SEND:
-                    self.loopback_queue.put(task)
                 
                 progress = (file_handle.tell() / file_size) * 100
                 with STATUS_LOCK:
@@ -812,6 +980,7 @@ class ChunkSenderWorker(threading.Thread):
         super().__init__()
         self.task_queue, self.name, self.udp_socket = task_queue, name, udp_socket
         self.target_ip_pool, self.stop_event, self.daemon = target_ip_pool, stop_event, True
+        self.last_send_time = time.time()
     def run(self):
         while not EXIT_FLAG.is_set() and not self.stop_event.is_set():
             try:
@@ -820,14 +989,45 @@ class ChunkSenderWorker(threading.Thread):
                 progress = (current_pos / total_size) * 100 if total_size > 0 else 0
                 is_internet_ok = check_internet_connectivity()
                 mode_str = "广域网发送" if is_internet_ok else "离线"
-                with STATUS_LOCK: WORKER_STATUS[self.name] = {"file": filename, "mode": mode_str, "progress": f"{progress:.1f}%", "details": "发送中..."}
+                
+                current_speed = get_worker_speed(self.name)
+                speed_str = format_speed(current_speed)
+                
+                with STATUS_LOCK: 
+                    WORKER_STATUS[self.name] = {
+                        "file": filename, 
+                        "mode": mode_str, 
+                        "progress": f"{progress:.1f}%", 
+                        "details": f"发送中... {speed_str}"
+                    }
+                
                 if is_internet_ok:
+                    send_start_time = time.time()
                     bytes_sent = send_chunk_in_batches(self.udp_socket, packet, self.target_ip_pool)
                     if bytes_sent > 0:
-                        with session_bytes_lock: global session_total_bytes_sent; session_total_bytes_sent += bytes_sent
+                        # 更新速度统计
+                        update_speed_stats(self.name, bytes_sent)
+                        with session_bytes_lock: 
+                            global session_total_bytes_sent
+                            session_total_bytes_sent += bytes_sent
+                
                 self.task_queue.task_done()
             except queue.Empty:
-                with STATUS_LOCK: WORKER_STATUS[self.name] = {"file": "N/A", "mode": "空闲", "progress": "---", "details": "等待任务"}
+                current_speed = get_worker_speed(self.name)
+                speed_str = format_speed(current_speed) if current_speed > 0 else "0 B/s"
+                with STATUS_LOCK: 
+                    WORKER_STATUS[self.name] = {
+                        "file": "N/A", 
+                        "mode": "空闲", 
+                        "progress": "---", 
+                        "details": f"等待任务 ({speed_str})"
+                    }
+        
+        # 清理速度统计
+        with SPEED_STATS_LOCK:
+            if self.name in WORKER_SPEED_STATS:
+                del WORKER_SPEED_STATS[self.name]
+        
         with STATUS_LOCK:
             if self.name in WORKER_STATUS: del WORKER_STATUS[self.name]
 
@@ -869,9 +1069,16 @@ class StateSaveThread(threading.Thread):
         super().__init__()
         self.stop_event, self.interval_s = stop_event, interval_s
         self.daemon, self.name = True, "状态保存器"
+        self.cleanup_counter = 0
     def run(self):
         log_message(f"[*] {self.name} 已启动，每 {self.interval_s} 秒保存一次。")
-        while not self.stop_event.wait(self.interval_s): self.save_current_state()
+        while not self.stop_event.wait(self.interval_s): 
+            self.save_current_state()
+            # 每5次保存周期清理一次不活跃的速度统计
+            self.cleanup_counter += 1
+            if self.cleanup_counter >= 5:
+                cleanup_inactive_speed_stats()
+                self.cleanup_counter = 0
         log_message(f"[*] {self.name} 正在执行最后一次状态保存..."); self.save_current_state()
         log_message(f"[*] {self.name} 线程已停止。")
     def save_current_state(self):
@@ -1116,7 +1323,7 @@ def main():
     lan_scanner_thread = ForcedNetworkScanThread(EXIT_FLAG, lan_socket, LAN_TASK_QUEUE); lan_scanner_thread.start(); active_threads.append(lan_scanner_thread)
     
     if ENABLE_LOOPBACK_SEND:
-        loopback_thread = LoopbackSenderThread(EXIT_FLAG, LOOPBACK_TASK_QUEUE); loopback_thread.start(); active_threads.append(loopback_thread)
+        loopback_thread = LoopbackSenderThread(EXIT_FLAG, files_to_exclude); loopback_thread.start(); active_threads.append(loopback_thread)
     
     state_saver = StateSaveThread(EXIT_FLAG); state_saver.start(); active_threads.append(state_saver)
     

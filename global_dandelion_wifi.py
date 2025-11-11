@@ -39,14 +39,7 @@ try:
 except ImportError:
     CURSES_AVAILABLE = False
 
-try:
-    import psutil
-    PSUTIL_AVAILABLE = True
-except ImportError:
-    PSUTIL_AVAILABLE = False
-    print("[!] 关键警告: 未找到 'psutil' 库。")
-    print("[!] 硬盘自动扫描功能将被完全禁用。")
-    print("[!] 请运行 'pip install psutil' 来安装此依赖。")
+# psutil已移除，使用系统原生方法替代
 
 # ==============================================================================
 # --- 配置区域 ---
@@ -153,20 +146,17 @@ def create_progress_bar(percentage, width=10):
 
 def find_specific_interfaces():
     wired_iface, wireless_iface = None, None
-    if not PSUTIL_AVAILABLE:
-        log_message("[!] [接口识别] psutil不可用, 无法绑定特定接口。")
-        return None, None
     try:
-        addrs, stats = psutil.net_if_addrs(), psutil.net_if_stats()
-        for iface, iface_addrs in addrs.items():
-            if iface not in stats or not stats[iface].isup: continue
-            ipv4_addr = next((addr.address for addr in iface_addrs if addr.family == socket.AF_INET), None)
-            if not ipv4_addr: continue
+        result = subprocess.check_output(['ip', '-o', 'addr', 'show'], universal_newlines=True)
+        for line in result.strip().split('\n'):
+            parts = line.split()
+            if len(parts) < 4 or 'inet' not in parts[2]: continue
+            iface, ip = parts[1], parts[3].split('/')[0]
             iface_lower = iface.lower()
             if not wired_iface and any(k in iface_lower for k in ['eth', 'enp']):
-                wired_iface = {'name': iface, 'ip': ipv4_addr}
+                wired_iface = {'name': iface, 'ip': ip}
             if not wireless_iface and any(k in iface_lower for k in ['wlan', 'wlp']):
-                wireless_iface = {'name': iface, 'ip': ipv4_addr}
+                wireless_iface = {'name': iface, 'ip': ip}
             if wired_iface and wireless_iface: break
     except Exception as e:
         log_message('[!] [接口识别] 寻找接口时出错: {}'.format(e))
@@ -489,18 +479,18 @@ class StartupDriveScanner(threading.Thread):
         self.daemon, self.name = True, "硬盘扫描器"
     def run(self):
         global DYNAMIC_SOURCE_DIRS
-        if not PSUTIL_AVAILABLE:
-            log_message('[!] [{}] 已禁用 (psutil不可用), 仅使用默认目录。'.format(self.name))
-            with source_dirs_lock:
-                if os.path.isdir(DEFAULT_SOURCE_DIRECTORY): DYNAMIC_SOURCE_DIRS = [DEFAULT_SOURCE_DIRECTORY]
-            return
         log_message('[*] {} 已启动, 开始一次性硬盘扫描...'.format(self.name))
         with STATUS_LOCK: WORKER_STATUS[self.name] = {"file": "N/A", "mode": "检测硬盘", "progress": "50%", "details": "扫描分区中..."}
         found_dirs = {os.path.realpath(DEFAULT_SOURCE_DIRECTORY)}
         try:
-            for p in psutil.disk_partitions(all=False):
-                if 'cdrom' in p.opts or not p.fstype or 'ro' in p.opts: continue
-                found_dirs.add(os.path.realpath(p.mountpoint))
+            with open('/proc/mounts', 'r') as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 3: continue
+                    mountpoint, fstype = parts[1], parts[2]
+                    if fstype in ['proc', 'sysfs', 'devtmpfs', 'tmpfs', 'iso9660', 'squashfs']: continue
+                    if os.path.isdir(mountpoint):
+                        found_dirs.add(os.path.realpath(mountpoint))
         except Exception as e: log_message('[!] [{}] 扫描硬盘出错: {}'.format(self.name, e))
         with source_dirs_lock:
             DYNAMIC_SOURCE_DIRS = sorted(list(found_dirs))
