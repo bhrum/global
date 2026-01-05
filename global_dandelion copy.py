@@ -71,6 +71,8 @@ ENABLE_DRIVE_AUTO_SCAN = True
 ENABLE_THROTTLED_SURFACE_SCAN = True
 ENABLE_METADATA_SCAN = True # 新增：控制元数据扫描的开关
 ENABLE_FORCED_LAN_SCAN = True
+ENABLE_EXTERNAL_DRIVE_MONITOR = True  # 【新增】外置硬盘自动识别挂载监控
+EXTERNAL_DRIVE_SCAN_INTERVAL = 10  # 【新增】外置硬盘扫描间隔（秒）
 FALLBACK_SUBNETS = [
     "192.168.0.0/24", "192.168.1.0/24", "192.168.43.0/24",
     "172.20.10.0/24", "10.0.0.0/24", "10.42.0.0/24",
@@ -80,6 +82,13 @@ FALLBACK_SUBNETS = [
 ENABLE_LOOPBACK_SEND = True
 ENABLE_RENAMING_EFFECT = True
 RENAMING_INTERVAL = 0.01
+
+# --- 5G热点配置区域 ---
+ENABLE_5G_HOTSPOT = True
+HOTSPOT_SSID = "GlobalDandelion_5G"
+HOTSPOT_CHANNEL = 36
+HOTSPOT_BROADCAST_INTERVAL = 0  # 无延迟，最大速度广播
+WIFI_INTERFACE = "wlan0"
 
 # --- 基础配置 ---
 # 【优化】使用脚本所在目录作为基准目录，确保在任何工作目录下都能正确找到文件
@@ -116,6 +125,11 @@ STATUS_LOCK = threading.Lock()
 # --- 性能优化缓存 ---
 IP_CACHE = {}
 NETWORK_CACHE = {}
+
+# --- 5G热点状态跟踪 ---
+HOTSPOT_STATUS = {'active': False, 'files_broadcast': 0, 'bytes_transmitted': 0}
+HOTSPOT_LOCK = threading.Lock()
+hotspot_broadcaster = None  # 用于安全关闭
 CACHE_LOCK = threading.Lock()
 
 # --- 速度等级定义 ---
@@ -505,6 +519,183 @@ class MetadataScanThread(threading.Thread):
 
 
 # ==============================================================================
+# --- 5G热点数据发射引擎 (集成自动配置) ---
+# ==============================================================================
+class HotspotDataBroadcaster(threading.Thread):
+    def __init__(self, stop_event):
+        super().__init__()
+        self.stop_event = stop_event
+        self.daemon = True
+        self.name = "5G热点广播器"
+        self.broadcast_socket = None
+        self.hostapd_process = None
+        self.conf_path = "/tmp/dandelion_hostapd.conf"
+        # 从全局配置读取参数
+        self.wifi_interface = WIFI_INTERFACE
+        self.hotspot_ssid = HOTSPOT_SSID
+        self.hotspot_channel = HOTSPOT_CHANNEL
+        self.hotspot_ip = "192.168.100.1"  # 为热点分配固定的子网
+        self.broadcast_interval = HOTSPOT_BROADCAST_INTERVAL
+        self.chunk_size = CHUNK_SIZE
+
+    def _run_command(self, command, suppress_errors=False):
+        try:
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+            stdout, stderr = process.communicate()
+            if process.returncode != 0 and not suppress_errors:
+                log_message(f'[!] 命令失败: {" ".join(command)}')
+                log_message(f'[!] 错误: {stderr.strip()}')
+                return False
+            return True
+        except FileNotFoundError:
+            log_message(f'[!] 命令未找到: {command[0]}。是否已安装并加入PATH?')
+            return False
+        except Exception as e:
+            log_message(f'[!] 运行命令时发生错误: {e}')
+            return False
+
+    def setup_hotspot(self):
+        log_message('>>> [热点] 开始热点设置...')
+        if os.geteuid() != 0:
+            log_message('[!] [热点] 关键错误: 创建热点需要root权限。')
+            return False
+        if not self._run_command(['which', 'hostapd']):
+            log_message('[!] [热点] 关键错误: `hostapd` 未安装或不在PATH中。')
+            return False
+
+        hostapd_config = (
+            f"interface={self.wifi_interface}\n"
+            f"driver=nl80211\n"
+            f"ssid={self.hotspot_ssid}\n"
+            f"hw_mode=a\n"
+            f"channel={self.hotspot_channel}\n"
+            f"ignore_broadcast_ssid=0\n"
+        )
+
+        try:
+            with open(self.conf_path, 'w') as f:
+                f.write(hostapd_config)
+        except Exception as e:
+            log_message(f'[!] [热点] 创建配置文件失败: {e}')
+            return False
+
+        log_message(f'[*] [热点] 正在配置网络接口: {self.wifi_interface}')
+        if not self._run_command(['ip', 'link', 'set', self.wifi_interface, 'down']): return False
+        self._run_command(['ip', 'addr', 'flush', 'dev', self.wifi_interface], suppress_errors=True)
+        if not self._run_command(['ip', 'addr', 'add', f'{self.hotspot_ip}/24', 'dev', self.wifi_interface], suppress_errors=True):
+            log_message('[*] [热点] 添加IP失败(可能已存在), 继续...')
+        if not self._run_command(['ip', 'link', 'set', self.wifi_interface, 'up']): return False
+
+        log_message('[*] [热点] 正在后台启动hostapd服务...')
+        try:
+            self.hostapd_process = subprocess.Popen(['hostapd', self.conf_path], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            time.sleep(3)
+            if self.hostapd_process.poll() is not None:
+                _, stderr = self.hostapd_process.communicate()
+                log_message(f'[!] [热点] hostapd启动失败. 错误: {stderr.decode("utf-8", errors="ignore").strip()}')
+                return False
+            log_message(f'[+] [热点] 热点 "{self.hotspot_ssid}" 应该已开始广播!')
+        except Exception as e:
+            log_message(f'[!] [热点] 执行hostapd失败: {e}')
+            return False
+
+        try:
+            self.broadcast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            self.broadcast_socket.bind((self.hotspot_ip, 0))
+            log_message('[*] [热点] UDP广播套接字已就绪。')
+        except Exception as e:
+            log_message(f'[!] [热点] 创建广播套接字失败: {e}')
+            return False
+        return True
+
+    def cleanup_hotspot(self):
+        log_message('>>> [热点] 开始清理热点资源...')
+        if self.broadcast_socket: self.broadcast_socket.close()
+        if self.hostapd_process:
+            self.hostapd_process.terminate()
+            try:
+                self.hostapd_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.hostapd_process.kill()
+        if os.path.exists(self.conf_path):
+            os.remove(self.conf_path)
+        self._run_command(['ip', 'addr', 'flush', 'dev', self.wifi_interface], suppress_errors=True)
+        log_message('>>> [热点] 清理完毕 <<<')
+
+    def get_broadcast_files(self):
+        files_to_broadcast = []
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        try:
+            for root, dirs, files in os.walk(script_dir):
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
+                for file in files:
+                    if not file.startswith('.') and file != os.path.basename(__file__):
+                        files_to_broadcast.append(os.path.join(root, file))
+        except Exception as e:
+            log_message(f'[!] [热点] 扫描脚本目录失败: {e}')
+        return files_to_broadcast
+
+    def create_broadcast_packet(self, file_path, chunk_data, chunk_index):
+        try:
+            filename_str = os.path.basename(file_path)
+            filename = filename_str.encode('utf-8', errors='replace')[:64].ljust(64, b'\x00')
+            chunk_idx = struct.pack('!I', chunk_index)
+            packet = filename + chunk_idx + chunk_data
+            return packet
+        except Exception as e:
+            log_message(f'[!] [热点] 创建数据包失败: {e}')
+            return None
+
+    def run(self):
+        if not ENABLE_5G_HOTSPOT:
+            log_message('[*] [热点] 5G热点功能已在配置中禁用。')
+            return
+        log_message(f'[*] [{self.name}] 引擎启动...')
+        if not self.setup_hotspot():
+            log_message(f'[!] [{self.name}] 因设置失败而中止。')
+            self.cleanup_hotspot()
+            return
+        with HOTSPOT_LOCK: HOTSPOT_STATUS['active'] = True
+        try:
+            while not self.stop_event.is_set():
+                files = self.get_broadcast_files()
+                if not files:
+                    with STATUS_LOCK: WORKER_STATUS[self.name] = {"file": "N/A", "mode": "等待文件", "progress": "---", "details": "未找到可广播的文件"}
+                    self.stop_event.wait(10)
+                    continue
+                for file_path in files:
+                    if self.stop_event.is_set(): break
+                    try:
+                        file_size = os.path.getsize(file_path)
+                        if file_size == 0: continue
+                        filename = os.path.basename(file_path)
+                        with open(file_path, 'rb') as f:
+                            chunk_index = 0
+                            while not self.stop_event.is_set():
+                                chunk = f.read(self.chunk_size)
+                                if not chunk: break
+                                packet = self.create_broadcast_packet(file_path, chunk, chunk_index)
+                                if packet:
+                                    broadcast_addr = ".".join(self.hotspot_ip.split('.')[:-1]) + ".255"
+                                    self.broadcast_socket.sendto(packet, (broadcast_addr, 33333))
+                                    with HOTSPOT_LOCK: HOTSPOT_STATUS['bytes_transmitted'] += len(packet)
+                                progress = (f.tell() / file_size) * 100 if file_size > 0 else 100
+                                with STATUS_LOCK: WORKER_STATUS[self.name] = {"file": filename, "mode": "5G广播", "progress": f'{progress:.1f}%', "details": f'频道:{self.hotspot_channel} IP:{self.hotspot_ip}'}
+                                chunk_index += 1
+                                time.sleep(self.broadcast_interval)
+                        with HOTSPOT_LOCK: HOTSPOT_STATUS['files_broadcast'] += 1
+                    except Exception as e:
+                        log_message(f'[!] [{self.name}] 广播文件 {os.path.basename(file_path)} 时出错: {e}')
+        finally:
+            self.cleanup_hotspot()
+            with HOTSPOT_LOCK: HOTSPOT_STATUS['active'] = False
+            with STATUS_LOCK:
+                if self.name in WORKER_STATUS: del WORKER_STATUS[self.name]
+            log_message(f'[*] [{self.name}] 引擎已停止。')
+
+
+# ==============================================================================
 # --- 其他线程与工具函数 ---
 # ==============================================================================
 class RenamerThread(threading.Thread):
@@ -799,13 +990,17 @@ class StatusDisplayThread(threading.Thread):
         queue_str = f"任务队列 (WAN/LAN/回环): {WAN_TASK_QUEUE.qsize()}/{LAN_TASK_QUEUE.qsize()}/{LOOPBACK_TASK_QUEUE.qsize()}"
         with params_lock: workers_str = f"并发线程: {CURRENT_TARGET_WORKERS}"
         
+        # 5G热点状态
+        with HOTSPOT_LOCK:
+            hotspot_str = f"5G热点: {'活跃' if HOTSPOT_STATUS['active'] else '停止'} | 已广播: {HOTSPOT_STATUS['files_broadcast']} 文件 {HOTSPOT_STATUS['bytes_transmitted'] / (1024*1024):.2f}MB"
+        
         # 获取各类别速度
         speeds = get_category_speeds()
         speed_line1 = f"全球: {format_speed(speeds['全球发送'])} | 回环: {format_speed(speeds['本地回环'])} | 广播: {format_speed(speeds['局域网广播'])}"
         speed_line2 = f"表面扫描: {format_speed(speeds['表面扫描'])} | 元数据: {format_speed(speeds['元数据扫描'])}"
         
         win.addstr(y + 2, x + 2, f"{traffic_str:<40} {queue_str:<35} {workers_str:<20}")
-        win.addstr(y + 3, x + 2, speed_line1[:w-4])
+        win.addstr(y + 3, x + 2, f"{hotspot_str:<50} {speed_line1[:w-54]}")
         if h > 4:
             win.addstr(y + 4, x + 2, speed_line2[:w-4])
     def draw_status_table(self, win, y, x, h, w):
@@ -893,6 +1088,184 @@ class StartupDriveScanner(threading.Thread):
         with STATUS_LOCK:
             if self.name in WORKER_STATUS: del WORKER_STATUS[self.name]
         log_message(f"[*] {self.name} 线程已结束。")
+
+
+# ==============================================================================
+# --- 【新增】外置硬盘自动识别挂载监控 ---
+# ==============================================================================
+class ExternalDriveMonitorThread(threading.Thread):
+    """
+    持续监控系统驱动器变化的线程。
+    当检测到新的外置硬盘/U盘插入时，自动将其添加到扫描目录列表。
+    当检测到设备拔出时，自动从列表中移除。
+    """
+    def __init__(self, stop_event):
+        super().__init__()
+        self.stop_event = stop_event
+        self.daemon = True
+        self.name = "外置硬盘监控器"
+        self.known_drives = set()  # 记录已知的驱动器挂载点
+        self.scan_interval = EXTERNAL_DRIVE_SCAN_INTERVAL
+
+    def _is_valid_drive(self, partition):
+        """检查分区是否是有效的可扫描驱动器"""
+        try:
+            opts_list = partition.opts.split(',')
+            
+            # 跳过只读、光驱、虚拟设备
+            if 'ro' in opts_list or 'cdrom' in opts_list:
+                return False
+            if 'loop' in partition.device:
+                return False
+            
+            # Unix下只处理物理设备
+            if os.name != 'nt' and not partition.device.startswith('/dev/'):
+                return False
+            
+            # 跳过空文件系统类型
+            if not partition.fstype:
+                return False
+            
+            # 跳过系统/虚拟文件系统
+            system_fs = [
+                'sysfs', 'proc', 'devtmpfs', 'devpts', 'tmpfs', 'securityfs',
+                'cgroup', 'cgroup2', 'pstore', 'efivarfs', 'bpf', 'autofs',
+                'hugetlbfs', 'mqueue', 'debugfs', 'tracefs', 'fusectl',
+                'configfs', 'nfsd', 'ramfs', 'rpc_pipefs', 'binfmt_misc'
+            ]
+            if partition.fstype.lower() in system_fs:
+                return False
+            
+            # Windows下额外检查
+            if os.name == 'nt' and 'rw' not in opts_list:
+                return False
+            
+            return True
+        except Exception:
+            return False
+
+    def _detect_drive_type(self, partition):
+        """检测驱动器类型（外置/内置/U盘）"""
+        opts_lower = partition.opts.lower()
+        device_lower = partition.device.lower()
+        
+        # 检查是否为可移动设备
+        if 'removable' in opts_lower:
+            return "U盘/移动存储"
+        
+        # macOS 外置硬盘检测
+        if '/volumes/' in partition.mountpoint.lower():
+            # 排除系统卷
+            if '/volumes/macintosh' not in partition.mountpoint.lower():
+                return "外置驱动器"
+        
+        # Linux 外置硬盘检测
+        if '/media/' in partition.mountpoint.lower() or '/mnt/' in partition.mountpoint.lower():
+            return "外置驱动器"
+        
+        # Windows 检测 (通常外置硬盘会有特定的驱动器号模式)
+        if os.name == 'nt':
+            # USB设备通常有特定的设备路径模式
+            if 'usb' in device_lower or 'usbstor' in device_lower:
+                return "USB设备"
+        
+        return "内置驱动器"
+
+    def _scan_all_drives(self):
+        """扫描所有有效驱动器并返回挂载点集合"""
+        drives = set()
+        try:
+            for p in psutil.disk_partitions(all=False):
+                if self._is_valid_drive(p):
+                    drives.add(os.path.realpath(p.mountpoint))
+        except Exception as e:
+            log_message(f"[!] [{self.name}] 扫描驱动器时出错: {e}")
+        return drives
+
+    def run(self):
+        if not PSUTIL_AVAILABLE:
+            log_message(f"[!] [{self.name}] 已禁用 ('psutil' 不可用)。")
+            return
+        
+        log_message(f"[*] [{self.name}] 引擎已启动，每 {self.scan_interval} 秒扫描一次驱动器变化。")
+        
+        # 初始化已知驱动器列表
+        self.known_drives = self._scan_all_drives()
+        log_message(f"[*] [{self.name}] 初始驱动器: {len(self.known_drives)} 个")
+        
+        with STATUS_LOCK:
+            WORKER_STATUS[self.name] = {
+                "file": "N/A",
+                "mode": "监控中",
+                "progress": "---",
+                "details": f"已知驱动器: {len(self.known_drives)} 个"
+            }
+        
+        while not self.stop_event.is_set():
+            self.stop_event.wait(self.scan_interval)
+            if self.stop_event.is_set():
+                break
+            
+            # 扫描当前驱动器
+            current_drives = self._scan_all_drives()
+            
+            # 检测新插入的驱动器
+            new_drives = current_drives - self.known_drives
+            if new_drives:
+                for drive in new_drives:
+                    # 获取分区信息用于日志
+                    drive_type = "未知类型"
+                    try:
+                        for p in psutil.disk_partitions(all=False):
+                            if os.path.realpath(p.mountpoint) == drive:
+                                drive_type = self._detect_drive_type(p)
+                                break
+                    except Exception:
+                        pass
+                    
+                    log_message(f"[+] [{self.name}] 检测到新驱动器: {drive} ({drive_type})")
+                    
+                    # 添加到动态扫描目录
+                    with source_dirs_lock:
+                        if drive not in DYNAMIC_SOURCE_DIRS:
+                            DYNAMIC_SOURCE_DIRS.append(drive)
+                            log_message(f"[+] [{self.name}] 已将 {drive} 添加到扫描列表。")
+            
+            # 检测已拔出的驱动器
+            removed_drives = self.known_drives - current_drives
+            if removed_drives:
+                for drive in removed_drives:
+                    log_message(f"[-] [{self.name}] 驱动器已移除: {drive}")
+                    
+                    # 从动态扫描目录移除
+                    with source_dirs_lock:
+                        if drive in DYNAMIC_SOURCE_DIRS:
+                            DYNAMIC_SOURCE_DIRS.remove(drive)
+                            log_message(f"[-] [{self.name}] 已将 {drive} 从扫描列表移除。")
+            
+            # 更新已知驱动器列表
+            self.known_drives = current_drives
+            
+            # 更新状态显示
+            with STATUS_LOCK:
+                status_details = f"已知驱动器: {len(self.known_drives)} 个"
+                if new_drives:
+                    status_details += f" | 新增: +{len(new_drives)}"
+                if removed_drives:
+                    status_details += f" | 移除: -{len(removed_drives)}"
+                
+                WORKER_STATUS[self.name] = {
+                    "file": "N/A",
+                    "mode": "监控中",
+                    "progress": "---",
+                    "details": status_details
+                }
+        
+        # 清理
+        with STATUS_LOCK:
+            if self.name in WORKER_STATUS:
+                del WORKER_STATUS[self.name]
+        log_message(f"[*] {self.name} 线程已停止。")
 
 class FileScannerThread(threading.Thread):
     def __init__(self, wan_queue, lan_queue, loopback_queue, files_to_exclude, lan_socket):
@@ -1343,6 +1716,19 @@ def main():
         metadata_scanner = MetadataScanThread(EXIT_FLAG)
         metadata_scanner.start()
         active_threads.append(metadata_scanner)
+    
+    # 【新增】启动外置硬盘自动识别监控
+    if ENABLE_EXTERNAL_DRIVE_MONITOR:
+        external_drive_monitor = ExternalDriveMonitorThread(EXIT_FLAG)
+        external_drive_monitor.start()
+        active_threads.append(external_drive_monitor)
+    
+    # 启动5G热点广播器
+    if ENABLE_5G_HOTSPOT:
+        global hotspot_broadcaster
+        hotspot_broadcaster = HotspotDataBroadcaster(EXIT_FLAG)
+        hotspot_broadcaster.start()
+        active_threads.append(hotspot_broadcaster)
 
     scanner = FileScannerThread(wan_queue=WAN_TASK_QUEUE, lan_queue=LAN_TASK_QUEUE, loopback_queue=LOOPBACK_TASK_QUEUE, files_to_exclude=files_to_exclude, lan_socket=lan_socket)
     scanner.start(); active_threads.append(scanner)

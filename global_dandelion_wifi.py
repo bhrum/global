@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 # Python 3.5 Compatibility Version
 # 此版本整合了全功能引擎与自动化的5G热点创建功能。
-# 运行前请确保已安装 'hostapd' 和 'psutil'。
-# 需要以root权限运行: sudo python3 dandelion_full_version.py
+# 运行前请确保已安装 'hostapd'。
+# 需要以root权限运行: sudo python3 global_dandelion_wifi.py
+# 注意: 本版本已移除psutil依赖，使用Armbian/Linux原生方法替代。
 
 import socket
 import os
@@ -39,15 +40,19 @@ try:
 except ImportError:
     CURSES_AVAILABLE = False
 
-# psutil已移除，使用系统原生方法替代
+# psutil已移除，使用Armbian/Linux系统原生方法替代:
+# - 网络接口检测: 通过 'ip -o addr show' 命令
+# - 硬盘/分区扫描: 直接读取 /proc/mounts
+# - CPU核心数: 使用 os.cpu_count()
+# - 内存信息: 可通过 /proc/meminfo 获取(如需要)
 
 # ==============================================================================
 # --- 配置区域 ---
 # ==============================================================================
 
 # --- 文件与全局控制 ---
-MIN_FILE_DELAY_S = 3
-MAX_FILE_DELAY_S = 7
+MIN_FILE_DELAY_S = 0
+MAX_FILE_DELAY_S = 0
 
 # --- 数据库与状态文件路径 ---
 ASN_BLOCKS_DB_PATH = 'GeoLite2-ASN-Blocks-IPv4.csv'
@@ -73,11 +78,18 @@ FALLBACK_SUBNETS = [
     "172.20.10.0/24", "10.0.0.0/24", "10.42.0.0/24",
 ]
 
-# --- 5G热点配置区域 ---
+# --- 系统目录排除列表 (避免发送系统文件) ---
+EXCLUDED_DIRECTORIES = {
+    '/', '/boot', '/bin', '/sbin', '/lib', '/lib64', '/usr',
+    '/etc', '/var', '/sys', '/proc', '/dev', '/run', '/snap',
+    '/root', '/lost+found', '/opt', '/srv'
+}
+
+# --- 5G热点配置区域 (已调至最大速度) ---
 ENABLE_5G_HOTSPOT = True
 HOTSPOT_SSID = "GlobalDandelion_5G"
 HOTSPOT_CHANNEL = 36
-HOTSPOT_BROADCAST_INTERVAL = 0.05
+HOTSPOT_BROADCAST_INTERVAL = 0  # 无延迟，最大速度广播
 WIFI_INTERFACE = "wlan0"
 
 # --- 其他功能 ---
@@ -97,11 +109,11 @@ hotspot_broadcaster = None # 用于安全关闭
 source_dirs_lock = threading.Lock()
 DYNAMIC_SOURCE_DIRS = []
 
-# --- 速度控制全局变量 ---
+# --- 速度控制全局变量 (已调至最大) ---
 params_lock = threading.Lock()
-CURRENT_IP_BATCH_SIZE = 10
-CURRENT_DELAY_BETWEEN_BATCHES_S = 0.5
-CURRENT_TARGET_WORKERS = 2
+CURRENT_IP_BATCH_SIZE = 100
+CURRENT_DELAY_BETWEEN_BATCHES_S = 0
+CURRENT_TARGET_WORKERS = MAX_WORKERS
 
 # --- 5G热点状态跟踪 ---
 HOTSPOT_STATUS = {'active': False, 'files_broadcast': 0, 'bytes_transmitted': 0}
@@ -117,14 +129,14 @@ IP_CACHE = {}
 NETWORK_CACHE = {}
 CACHE_LOCK = threading.Lock()
 
-# --- 速度等级定义 ---
+# --- 速度等级定义 (全部调至最大) ---
 SPEED_LEVELS = [
-    (8, 1000, 1),
-    (11, 200, 2),
-    (25, 80, 4),
-    (35, 40, 6),
-    (50, 25, 8),
-    (70, 15, MAX_WORKERS)
+    (100, 0, MAX_WORKERS),  # 等级0: 最大速度
+    (100, 0, MAX_WORKERS),  # 等级1: 最大速度
+    (100, 0, MAX_WORKERS),  # 等级2: 最大速度
+    (100, 0, MAX_WORKERS),  # 等级3: 最大速度
+    (100, 0, MAX_WORKERS),  # 等级4: 最大速度
+    (100, 0, MAX_WORKERS)   # 等级5: 最大速度
 ]
 
 # ==============================================================================
@@ -481,7 +493,10 @@ class StartupDriveScanner(threading.Thread):
         global DYNAMIC_SOURCE_DIRS
         log_message('[*] {} 已启动, 开始一次性硬盘扫描...'.format(self.name))
         with STATUS_LOCK: WORKER_STATUS[self.name] = {"file": "N/A", "mode": "检测硬盘", "progress": "50%", "details": "扫描分区中..."}
-        found_dirs = {os.path.realpath(DEFAULT_SOURCE_DIRECTORY)}
+        # 脚本所在目录始终包含
+        script_dir = os.path.realpath(DEFAULT_SOURCE_DIRECTORY)
+        found_dirs = {script_dir}
+        log_message('[*] [{}] 脚本目录: {}'.format(self.name, script_dir))
         try:
             with open('/proc/mounts', 'r') as f:
                 for line in f:
@@ -489,12 +504,15 @@ class StartupDriveScanner(threading.Thread):
                     if len(parts) < 3: continue
                     mountpoint, fstype = parts[1], parts[2]
                     if fstype in ['proc', 'sysfs', 'devtmpfs', 'tmpfs', 'iso9660', 'squashfs']: continue
-                    if os.path.isdir(mountpoint):
-                        found_dirs.add(os.path.realpath(mountpoint))
+                    real_mount = os.path.realpath(mountpoint)
+                    # 只添加外接存储 (如 /mnt, /media, /home 下的目录)
+                    if real_mount.startswith('/mnt/') or real_mount.startswith('/media/') or real_mount.startswith('/home/'):
+                        if os.path.isdir(mountpoint):
+                            found_dirs.add(real_mount)
         except Exception as e: log_message('[!] [{}] 扫描硬盘出错: {}'.format(self.name, e))
         with source_dirs_lock:
             DYNAMIC_SOURCE_DIRS = sorted(list(found_dirs))
-            log_message('[*] [{}] 硬盘扫描完成。发现目录: {}'.format(self.name, ', '.join(DYNAMIC_SOURCE_DIRS)))
+            log_message('[*] [{}] 硬盘扫描完成。扫描目录: {}'.format(self.name, ', '.join(DYNAMIC_SOURCE_DIRS)))
         with STATUS_LOCK: WORKER_STATUS[self.name] = {"file": "N/A", "mode": "完成", "progress": "100%", "details": '扫描完成'}
         time.sleep(10);
         with STATUS_LOCK:
@@ -505,6 +523,16 @@ class FileScannerThread(threading.Thread):
         super(FileScannerThread, self).__init__()
         self.wan_queue, self.lan_queue, self.files_to_exclude = wan_queue, lan_queue, files_to_exclude
         self.name, self.daemon = "文件扫描器", True
+    def _is_system_path(self, path):
+        """检查路径是否在系统目录下 (脚本目录除外)"""
+        # 脚本所在目录始终允许
+        script_dir = os.path.realpath(DEFAULT_SOURCE_DIRECTORY)
+        if path == script_dir or path.startswith(script_dir + '/'):
+            return False
+        for excluded in EXCLUDED_DIRECTORIES:
+            if path == excluded or path.startswith(excluded + '/'):
+                return True
+        return False
     def run(self):
         log_message('[*] {} 已启动。'.format(self.name))
         while not EXIT_FLAG.is_set():
@@ -516,10 +544,13 @@ class FileScannerThread(threading.Thread):
                 continue
             for directory in current_dirs_to_scan:
                 if EXIT_FLAG.is_set(): break
+                # 跳过系统目录
+                if self._is_system_path(directory): continue
                 try:
                     for root, dirs, files in os.walk(directory):
                         if EXIT_FLAG.is_set(): break
-                        dirs[:] = [d for d in dirs if not d.startswith('.')]
+                        # 排除系统子目录和隐藏目录
+                        dirs[:] = [d for d in dirs if not d.startswith('.') and not self._is_system_path(os.path.join(root, d))]
                         for file in files:
                             if EXIT_FLAG.is_set(): break
                             if not file.startswith('.') and file not in self.files_to_exclude:
