@@ -30,15 +30,158 @@ except ImportError:
     CURSES_AVAILABLE = False
 
 
-# 尝试导入 psutil 库，这是脚本核心功能所必需的
-try:
-    import psutil
-    PSUTIL_AVAILABLE = True
-except ImportError:
-    PSUTIL_AVAILABLE = False
-    print("[!] 严重警告: 未找到 'psutil' 库。")
-    print("[!] 驱动器自动扫描功能将完全失效。")
-    print("[!] 请运行 'pip install psutil' 来安装此依赖库。")
+# ==============================================================================
+# --- Linux 原生系统接口（替代 psutil）---
+# ==============================================================================
+
+class DiskPartition:
+    """模拟 psutil 的分区对象"""
+    def __init__(self, device, mountpoint, fstype, opts):
+        self.device = device
+        self.mountpoint = mountpoint
+        self.fstype = fstype
+        self.opts = opts
+
+class DiskUsage:
+    """模拟 psutil 的磁盘使用对象"""
+    def __init__(self, total, used, free):
+        self.total = total
+        self.used = used
+        self.free = free
+
+def linux_get_disk_partitions(all_partitions=False):
+    """
+    解析 /proc/mounts 获取磁盘分区信息
+    返回类似 psutil.disk_partitions() 的分区列表
+    """
+    partitions = []
+    # 仅过滤纯虚拟的系统文件系统类型
+    virtual_fs = {'sysfs', 'proc', 'devtmpfs', 'devpts', 'securityfs',
+                  'cgroup', 'cgroup2', 'pstore', 'efivarfs', 'bpf', 'autofs',
+                  'hugetlbfs', 'mqueue', 'debugfs', 'tracefs', 'fusectl',
+                  'configfs', 'nfsd', 'rpc_pipefs', 'binfmt_misc', 'nsfs'}
+    
+    try:
+        with open('/proc/mounts', 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 4:
+                    continue
+                device, mountpoint, fstype, opts = parts[0], parts[1], parts[2], parts[3]
+                
+                # 过滤虚拟文件系统（除非 all_partitions=True）
+                if not all_partitions:
+                    if fstype in virtual_fs:
+                        continue
+                    # 【修复】更宽松的设备过滤，允许 fuse 和绑定挂载
+                    # 只跳过明显的非存储设备，但保留 overlay、tmpfs 等可能含数据的分区
+                    if device in ('none', 'udev', 'devpts'):
+                        continue
+                
+                # 处理挂载点中的转义字符（如 \040 表示空格）
+                mountpoint = mountpoint.replace('\\040', ' ').replace('\\011', '\t')
+                
+                partitions.append(DiskPartition(device, mountpoint, fstype, opts))
+    except Exception as e:
+        print(f"[!] 读取 /proc/mounts 失败: {e}")
+    
+    return partitions
+
+def linux_get_disk_usage(mountpoint):
+    """
+    使用 os.statvfs 获取磁盘使用情况
+    返回类似 psutil.disk_usage() 的使用信息对象
+    """
+    try:
+        st = os.statvfs(mountpoint)
+        total = st.f_blocks * st.f_frsize
+        free = st.f_bavail * st.f_frsize  # 非 root 用户可用空间
+        used = total - (st.f_bfree * st.f_frsize)
+        return DiskUsage(total, used, free)
+    except Exception as e:
+        raise OSError(f"无法获取 {mountpoint} 的磁盘使用情况: {e}")
+
+def linux_get_net_interfaces():
+    """
+    通过 /sys/class/net 和 socket 获取网卡信息
+    返回格式: {
+        'addrs': {iface_name: [{'address': ip, 'family': AF_INET}]},
+        'stats': {iface_name: {'isup': bool, 'isloop': bool}}
+    }
+    """
+    result = {'addrs': {}, 'stats': {}}
+    net_path = '/sys/class/net'
+    
+    try:
+        for iface in os.listdir(net_path):
+            iface_path = os.path.join(net_path, iface)
+            
+            # 获取网卡状态
+            is_up = False
+            is_loop = iface == 'lo'
+            operstate_path = os.path.join(iface_path, 'operstate')
+            if os.path.exists(operstate_path):
+                try:
+                    with open(operstate_path, 'r') as f:
+                        state = f.read().strip()
+                        is_up = state in ('up', 'unknown')
+                except:
+                    pass
+            
+            result['stats'][iface] = {'isup': is_up, 'isloop': is_loop}
+            result['addrs'][iface] = []
+            
+            # 获取 IPv4 地址
+            try:
+                # 使用 socket 获取接口 IP
+                import fcntl
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    ip_addr = socket.inet_ntoa(fcntl.ioctl(
+                        sock.fileno(),
+                        0x8915,  # SIOCGIFADDR
+                        struct.pack('256s', iface.encode('utf-8')[:15])
+                    )[20:24])
+                    result['addrs'][iface].append({
+                        'address': ip_addr,
+                        'family': socket.AF_INET
+                    })
+                except:
+                    pass
+                finally:
+                    sock.close()
+            except:
+                pass
+    except Exception as e:
+        print(f"[!] 读取网络接口失败: {e}")
+    
+    return result
+
+def linux_get_net_connections():
+    """
+    解析 /proc/net/tcp 和 /proc/net/tcp6 获取已建立的连接数
+    返回 ESTABLISHED 状态的连接数量
+    """
+    established_count = 0
+    # TCP 状态码 01 = ESTABLISHED
+    
+    for proto_file in ['/proc/net/tcp', '/proc/net/tcp6']:
+        try:
+            if not os.path.exists(proto_file):
+                continue
+            with open(proto_file, 'r') as f:
+                lines = f.readlines()[1:]  # 跳过标题行
+                for line in lines:
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        # 第4列是状态码
+                        state = parts[3]
+                        if state == '01':  # ESTABLISHED
+                            established_count += 1
+        except Exception:
+            pass
+    
+    return established_count
 
 # ==============================================================================
 # --- 配置区域 ---
@@ -47,13 +190,19 @@ except ImportError:
 # --- 文件与全局控制 ---
 MIN_FILE_DELAY_S = 3
 MAX_FILE_DELAY_S = 7
-MONTHLY_LIMIT_GB = 180000000000000000000000
+
+# --- 【极速优化】本地回环配置 ---
+LOOPBACK_FILE_DELAY_S = 0  # 本地回环文件间延迟（0=极速）
+LOOPBACK_CHUNK_SIZE = 65536  # 本地回环数据块大小（64KB，最大化吞吐）
+LOOPBACK_PORT_START = 10000  # 本地回环起始端口
+LOOPBACK_PORT_END = 10500    # 本地回环结束端口（500个端口，5倍吞吐）
+LOOPBACK_THREAD_COUNT = 8    # 回环发送器线程数（并行发送）
+LOOPBACK_BATCH_PORTS = 50    # 每批次发送的端口数（减少循环开销）
 
 # --- 数据库与状态文件路径 ---
 ASN_BLOCKS_DB_PATH = 'GeoLite2-ASN-Blocks-IPv4.csv'
 COUNTRY_BLOCKS_DB_PATH = 'GeoLite2-Country-Blocks-IPv4.csv'
 COUNTRY_LOCATIONS_DB_PATH = 'GeoLite2-Country-Locations-en.csv'
-STATE_FILE_PATH = 'dandelion_state.json'
 ASN_EXCLUSION_LIST = []
 
 # --- 【优化】线程与数据包配置 ---
@@ -109,13 +258,9 @@ CURRENT_IP_BATCH_SIZE = 10
 CURRENT_DELAY_BETWEEN_BATCHES_S = 0.5
 CURRENT_TARGET_WORKERS = 2
 
-# --- 流量追踪 (线程安全) ---
-session_total_bytes_sent = 0
-session_bytes_lock = threading.Lock()
-
 # --- 速度追踪 ---
 WORKER_SPEED_STATS = {}  # 存储每个工作线程的速度统计
-SPEED_STATS_LOCK = threading.Lock()
+SPEED_STATS_LOCK = threading.RLock() # 使用可重入锁以支持嵌套调用
 
 # --- 状态显示与日志 ---
 WORKER_STATUS = {}
@@ -163,29 +308,36 @@ def create_progress_bar(percentage, width=10):
     return f"[{bar}] {percentage:5.1f}%"
 
 def update_speed_stats(worker_name, bytes_sent):
-    """更新工作线程的速度统计"""
+    """
+    更新工作线程的速度统计
+    【修复】记录已发送字节，速度计算逻辑移至 get_worker_speed 以支持实时预估
+    """
     current_time = time.time()
     with SPEED_STATS_LOCK:
         if worker_name not in WORKER_SPEED_STATS:
             WORKER_SPEED_STATS[worker_name] = {
-                'bytes_sent': 0,
+                'bytes_in_window': 0,      # 当前窗口累积的字节数
+                'window_start': current_time,  # 窗口开始时间
                 'last_update': current_time,
-                'speed_history': deque(maxlen=10),  # 保留最近10次的速度记录
+                'speed_history': deque(maxlen=10),
                 'current_speed': 0
             }
         
         stats = WORKER_SPEED_STATS[worker_name]
-        time_diff = current_time - stats['last_update']
+        stats['bytes_in_window'] += bytes_sent
+        stats['last_update'] = current_time
         
-        if time_diff > 0:
-            speed = bytes_sent / time_diff  # bytes per second
+        # 每隔 0.5 秒更新一次历史速度，降低锁竞争并提高响应速度
+        window_duration = current_time - stats['window_start']
+        if window_duration >= 0.5:
+            speed = stats['bytes_in_window'] / window_duration
             stats['speed_history'].append(speed)
-            # 计算平均速度
             if stats['speed_history']:
                 stats['current_speed'] = sum(stats['speed_history']) / len(stats['speed_history'])
-        
-        stats['bytes_sent'] += bytes_sent
-        stats['last_update'] = current_time
+            
+            # 重置窗口
+            stats['bytes_in_window'] = 0
+            stats['window_start'] = current_time
 
 def format_speed(bytes_per_sec):
     """格式化速度显示"""
@@ -196,11 +348,26 @@ def format_speed(bytes_per_sec):
     else:
         return f"{bytes_per_sec / (1024 * 1024):.1f} MB/s"
 
+def _get_instantaneous_speed(stats, current_time):
+    """
+    内部辅助函数：根据统计对象计算实时预估速度（需持有 SPEED_STATS_LOCK）
+    """
+    window_duration = current_time - stats['window_start']
+    if window_duration > 0.1 and stats['bytes_in_window'] > 0:
+        instant_speed = stats['bytes_in_window'] / window_duration
+        if stats.get('current_speed', 0) > 0:
+            return (stats['current_speed'] * 0.7) + (instant_speed * 0.3)
+        return instant_speed
+    return stats.get('current_speed', 0)
+
 def get_worker_speed(worker_name):
-    """获取工作线程的当前速度"""
+    """
+    获取工作线程的当前速度（带实时预估）
+    """
+    current_time = time.time()
     with SPEED_STATS_LOCK:
         if worker_name in WORKER_SPEED_STATS:
-            return WORKER_SPEED_STATS[worker_name]['current_speed']
+            return _get_instantaneous_speed(WORKER_SPEED_STATS[worker_name], current_time)
     return 0
 
 def get_category_speeds():
@@ -213,13 +380,15 @@ def get_category_speeds():
         '元数据扫描': 0
     }
     
+    current_time = time.time()
     with SPEED_STATS_LOCK:
         for worker_name, stats in WORKER_SPEED_STATS.items():
-            speed = stats['current_speed']
-            if '发送器' in worker_name:
-                speeds['全球发送'] += speed
-            elif '回环发送器' in worker_name:
+            speed = _get_instantaneous_speed(stats, current_time)
+            # 【修复】更宽松的归类逻辑，涵盖数字命名的端口发送器
+            if '回环发送器' in worker_name:
                 speeds['本地回环'] += speed
+            elif '发送器' in worker_name or '端口' in worker_name:
+                speeds['全球发送'] += speed
             elif '广播器' in worker_name:
                 speeds['局域网广播'] += speed
             elif '表面扫描' in worker_name:
@@ -244,14 +413,12 @@ def cleanup_inactive_speed_stats():
 
 def find_specific_interfaces():
     wired_iface, wireless_iface = None, None
-    if not PSUTIL_AVAILABLE:
-        log_message("[!] [网卡识别] psutil 不可用，无法绑定特定网卡。")
-        return None, None
     try:
-        addrs, stats = psutil.net_if_addrs(), psutil.net_if_stats()
+        net_info = linux_get_net_interfaces()
+        addrs, stats = net_info['addrs'], net_info['stats']
         for iface, iface_addrs in addrs.items():
-            if not (iface in stats and stats[iface].isup and not stats[iface].isloop): continue
-            ipv4_addr = next((addr.address for addr in iface_addrs if addr.family == socket.AF_INET), None)
+            if not (iface in stats and stats[iface]['isup'] and not stats[iface]['isloop']): continue
+            ipv4_addr = next((addr['address'] for addr in iface_addrs if addr['family'] == socket.AF_INET), None)
             if not ipv4_addr: continue
             iface_lower = iface.lower()
             if not wired_iface and any(k in iface_lower for k in ['ethernet', 'eth', 'enp', 'eno', 'ens']):
@@ -325,19 +492,16 @@ class ThrottledSurfaceScanThread(threading.Thread):
 
     def run(self):
         log_message(f"[*] [{self.name}] 引擎已启动，将【全速】循环扫描所有大于 {self.min_disk_size_gb}GB 的硬盘。")
-        if not PSUTIL_AVAILABLE:
-            log_message(f"[!] [{self.name}] 已禁用 ('psutil' 不可用)。")
-            return
 
         min_size_bytes = self.min_disk_size_gb * (1024 ** 3)
 
         while not self.stop_event.is_set():
             scannable_partitions = []
             try:
-                all_partitions = psutil.disk_partitions(all=True)
+                all_partitions = linux_get_disk_partitions(all_partitions=True)
                 for p in all_partitions:
                     try:
-                        usage = psutil.disk_usage(p.mountpoint)
+                        usage = linux_get_disk_usage(p.mountpoint)
                         if usage.total < min_size_bytes:
                             continue
                     except Exception:
@@ -373,7 +537,7 @@ class ThrottledSurfaceScanThread(threading.Thread):
 
                 total_size = 0
                 try:
-                    total_size = psutil.disk_usage(p.mountpoint).total
+                    total_size = linux_get_disk_usage(p.mountpoint).total
                 except Exception as e:
                     log_message(f"[*] [{self.name}] 无法获取 {p.device} 大小，跳过: {e}")
                     continue
@@ -442,18 +606,15 @@ class MetadataScanThread(threading.Thread):
 
     def run(self):
         log_message(f"[*] [{self.name}] 引擎已启动，将【单线程】循环扫描所有大于 {self.min_disk_size_gb}GB 硬盘的元数据。")
-        if not PSUTIL_AVAILABLE:
-            log_message(f"[!] [{self.name}] 已禁用 ('psutil' 不可用)。")
-            return
         
         min_size_bytes = self.min_disk_size_gb * (1024 ** 3)
 
         while not self.stop_event.is_set():
             scannable_mounts = []
             try:
-                for p in psutil.disk_partitions(all=False):
+                for p in linux_get_disk_partitions(all_partitions=False):
                     try:
-                        usage = psutil.disk_usage(p.mountpoint)
+                        usage = linux_get_disk_usage(p.mountpoint)
                         if usage.total < min_size_bytes:
                             continue
                     except Exception:
@@ -536,7 +697,8 @@ class HotspotDataBroadcaster(threading.Thread):
         self.hotspot_channel = HOTSPOT_CHANNEL
         self.hotspot_ip = "192.168.100.1"  # 为热点分配固定的子网
         self.broadcast_interval = HOTSPOT_BROADCAST_INTERVAL
-        self.chunk_size = CHUNK_SIZE
+        self.chunk_size = 1400  # 【优化】提升至接近 MTU 的大小 (1400 < 1500)
+        self.broadcast_addr = ".".join(self.hotspot_ip.split('.')[:-1]) + ".255" # 【优化】预计算广播地址
 
     def _run_command(self, command, suppress_errors=False):
         try:
@@ -602,8 +764,10 @@ class HotspotDataBroadcaster(threading.Thread):
         try:
             self.broadcast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            # 【优化】设置极大的发送缓冲区以支持爆发性流量
+            self.broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024 * 2) 
             self.broadcast_socket.bind((self.hotspot_ip, 0))
-            log_message('[*] [热点] UDP广播套接字已就绪。')
+            log_message('[*] [热点] UDP广播套接字已就绪 (SO_SNDBUF=2MB)。')
         except Exception as e:
             log_message(f'[!] [热点] 创建广播套接字失败: {e}')
             return False
@@ -670,20 +834,60 @@ class HotspotDataBroadcaster(threading.Thread):
                         file_size = os.path.getsize(file_path)
                         if file_size == 0: continue
                         filename = os.path.basename(file_path)
+                        
+                        # 局部变量缓存以加速访问
+                        b_addr = self.broadcast_addr
+                        b_sock = self.broadcast_socket
+                        b_interval = self.broadcast_interval
+                        c_size = self.chunk_size
+                        
                         with open(file_path, 'rb') as f:
                             chunk_index = 0
+                            bytes_since_last_stat = 0
+                            last_stat_update = time.time()
+                            
                             while not self.stop_event.is_set():
-                                chunk = f.read(self.chunk_size)
+                                chunk = f.read(c_size)
                                 if not chunk: break
                                 packet = self.create_broadcast_packet(file_path, chunk, chunk_index)
                                 if packet:
-                                    broadcast_addr = ".".join(self.hotspot_ip.split('.')[:-1]) + ".255"
-                                    self.broadcast_socket.sendto(packet, (broadcast_addr, 33333))
-                                    with HOTSPOT_LOCK: HOTSPOT_STATUS['bytes_transmitted'] += len(packet)
-                                progress = (f.tell() / file_size) * 100 if file_size > 0 else 100
-                                with STATUS_LOCK: WORKER_STATUS[self.name] = {"file": filename, "mode": "5G广播", "progress": f'{progress:.1f}%', "details": f'频道:{self.hotspot_channel} IP:{self.hotspot_ip}'}
+                                    b_sock.sendto(packet, (b_addr, 33333))
+                                    packet_len = len(packet)
+                                    bytes_since_last_stat += packet_len
+                                    
+                                    # 【优化】批量更新统计和状态，减少颗粒度过细导致的锁竞争
+                                    # 每 1MB 或 0.5 秒更新一次
+                                    current_now = time.time()
+                                    if bytes_since_last_stat > 1024 * 1024 or current_now - last_stat_update > 0.5:
+                                        with HOTSPOT_LOCK: 
+                                            HOTSPOT_STATUS['bytes_transmitted'] += bytes_since_last_stat
+                                        
+                                        progress = (f.tell() / file_size) * 100 if file_size > 0 else 100
+                                        details = f'频道:{self.hotspot_channel} IP:{self.hotspot_ip}'
+                                        
+                                        # 更新速度统计
+                                        update_speed_stats(self.name, bytes_since_last_stat)
+                                        
+                                        with STATUS_LOCK: 
+                                            WORKER_STATUS[self.name] = {
+                                                "file": filename, 
+                                                "mode": "5G广播", 
+                                                "progress": f'{progress:.1f}%', 
+                                                "details": details
+                                            }
+                                        
+                                        bytes_since_last_stat = 0
+                                        last_stat_update = current_now
+                                        
                                 chunk_index += 1
-                                time.sleep(self.broadcast_interval)
+                                if b_interval > 0:
+                                    time.sleep(b_interval)
+                        
+                        # 完成一个文件，确保最后一点数据被计入
+                        if bytes_since_last_stat > 0:
+                            with HOTSPOT_LOCK: HOTSPOT_STATUS['bytes_transmitted'] += bytes_since_last_stat
+                            update_speed_stats(self.name, bytes_since_last_stat)
+                            
                         with HOTSPOT_LOCK: HOTSPOT_STATUS['files_broadcast'] += 1
                     except Exception as e:
                         log_message(f'[!] [{self.name}] 广播文件 {os.path.basename(file_path)} 时出错: {e}')
@@ -726,15 +930,33 @@ class RenamerThread(threading.Thread):
             except Exception as e: log_message(f"[!] 恢复 '{self.original_basename}' 失败: {e}")
 
 class LoopbackSenderThread(threading.Thread):
-    def __init__(self, stop_event, files_to_exclude):
+    """
+    【极速优化】本地回环发送器 - 文件内分块并行版本
+    - 多线程同时处理同一个文件的不同块
+    - 每个线程从不同的起始块开始，交错读取
+    - 即使只有一个文件也能充分利用所有线程
+    """
+    def __init__(self, stop_event, files_to_exclude, thread_id=0):
         super().__init__()
-        self.stop_event, self.daemon, self.name = stop_event, True, "回环发送器"
-        self.loopback_socket = None
+        self.stop_event = stop_event
+        self.daemon = True
+        self.thread_id = thread_id
+        self.name = f"回环发送器-{thread_id}"
         self.files_to_exclude = files_to_exclude
+        self.sockets = []
+        # 预分配目标地址列表
+        self.target_addrs = [('127.0.0.1', port) for port in range(LOOPBACK_PORT_START, LOOPBACK_PORT_END)]
+        self.port_count = len(self.target_addrs)
+        
     def run(self):
+        # 创建多个socket用于并行发送
+        socket_count = min(4, self.port_count // LOOPBACK_BATCH_PORTS + 1)
         try:
-            self.loopback_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            log_message(f"[*] [{self.name}] 引擎已启动，将处理硬盘文件并发送至本地回环。")
+            for i in range(socket_count):
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
+                self.sockets.append(sock)
+            log_message(f"[*] [{self.name}] 极速引擎已启动 (块并行模式, x{socket_count}sockets, {self.port_count}端口)")
         except Exception as e:
             log_message(f"[!] [{self.name}] 创建套接字失败: {e}")
             return
@@ -745,7 +967,7 @@ class LoopbackSenderThread(threading.Thread):
             if not current_dirs:
                 with STATUS_LOCK:
                     WORKER_STATUS[self.name] = {"file": "N/A", "mode": "等待目录", "progress": "---", "details": "等待驱动器扫描..."}
-                time.sleep(10)
+                time.sleep(5)
                 continue
             
             for directory in current_dirs:
@@ -758,63 +980,104 @@ class LoopbackSenderThread(threading.Thread):
                         for file in files:
                             if self.stop_event.is_set(): break
                             if not file.startswith('.') and file not in self.files_to_exclude:
-                                self.process_file(os.path.join(root, file))
+                                # 所有线程都处理同一个文件，但从不同块开始
+                                self.process_file_parallel(os.path.join(root, file))
                 except Exception as e:
                     log_message(f"[!] [{self.name}] 扫描目录 '{directory}' 时出错: {e}")
         
-        # 清理速度统计
+        # 清理
+        for sock in self.sockets:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        
         with SPEED_STATS_LOCK:
             if self.name in WORKER_SPEED_STATS:
                 del WORKER_SPEED_STATS[self.name]
-        
-        if self.loopback_socket:
-            self.loopback_socket.close()
         with STATUS_LOCK:
             if self.name in WORKER_STATUS: del WORKER_STATUS[self.name]
         log_message(f"[*] {self.name} 线程已停止。")
     
-    def process_file(self, file_path):
+    def process_file_parallel(self, file_path):
+        """
+        文件内分块并行处理
+        - 每个线程从 thread_id 对应的块开始
+        - 步进为 LOOPBACK_THREAD_COUNT（跳过其他线程的块）
+        """
         try:
             if not os.path.exists(file_path): return
             file_size = os.path.getsize(file_path)
             if file_size == 0: return
             
+            chunk_size = LOOPBACK_CHUNK_SIZE
+            total_chunks = (file_size + chunk_size - 1) // chunk_size  # 向上取整
+            thread_count = LOOPBACK_THREAD_COUNT
+            
+            # 计算本线程负责的起始块和步进
+            start_chunk = self.thread_id
+            step = thread_count
+            
+            # 计算本线程需要处理的块数
+            my_chunks = (total_chunks - start_chunk + step - 1) // step
+            if my_chunks <= 0:
+                return  # 文件太小，本线程无需处理
+            
             with open(file_path, 'rb') as f:
-                chunk_index = 0
-                while not self.stop_event.is_set():
-                    chunk_data = f.read(CHUNK_SIZE)
-                    if not chunk_data: break
+                socket_idx = 0
+                batch_size = LOOPBACK_BATCH_PORTS
+                processed_chunks = 0
+                
+                for chunk_index in range(start_chunk, total_chunks, step):
+                    if self.stop_event.is_set(): break
                     
+                    # 定位到对应块的位置
+                    offset = chunk_index * chunk_size
+                    f.seek(offset)
+                    chunk_data = f.read(chunk_size)
+                    if not chunk_data: continue
+                    
+                    # 构建数据包
                     packet = struct.pack('!I', chunk_index) + hashlib.md5(chunk_data).digest() + chunk_data
-                    chunk_index += 1
+                    packet_len = len(packet)
+                    processed_chunks += 1
                     
                     bytes_sent = 0
-                    for port in range(10000, 10010):
+                    # 批量发送到所有端口
+                    for i in range(0, self.port_count, batch_size):
                         if self.stop_event.is_set(): break
-                        try:
-                            self.loopback_socket.sendto(packet, ('127.0.0.1', port))
-                            bytes_sent += len(packet)
-                        except Exception:
-                            pass
+                        sock = self.sockets[socket_idx % len(self.sockets)]
+                        socket_idx += 1
+                        
+                        batch_end = min(i + batch_size, self.port_count)
+                        batch_bytes = 0
+                        for j in range(i, batch_end):
+                            try:
+                                sock.sendto(packet, self.target_addrs[j])
+                                batch_bytes += packet_len
+                            except Exception:
+                                pass
+                        
+                        # 【优化】累积本地流量，减少对全局锁的频繁竞争
+                        if batch_bytes > 0:
+                            bytes_sent += batch_bytes
+                            # 仅在处理完一个端口批次后更新一次统计
+                            update_speed_stats(self.name, batch_bytes)
                     
-                    if bytes_sent > 0:
-                        update_speed_stats(self.name, bytes_sent)
-                    
-                    progress = (f.tell() / file_size) * 100
+                    # 计算本线程的进度
+                    progress = (processed_chunks / my_chunks) * 100 if my_chunks > 0 else 100
                     current_speed = get_worker_speed(self.name)
                     
                     with STATUS_LOCK:
                         WORKER_STATUS[self.name] = {
                             "file": os.path.basename(file_path),
-                            "mode": "回环发送",
+                            "mode": "极速回环",
                             "progress": f"{progress:.1f}%",
-                            "details": f"处理数据块 {chunk_index} | {format_speed(current_speed)}"
+                            "details": f"块{chunk_index}/{total_chunks} x{self.port_count}端口 | {format_speed(current_speed)}"
                         }
         except Exception as e:
             if not self.stop_event.is_set():
                 log_message(f"[!] [{self.name}] 处理文件 {file_path} 时出错: {e}")
-        finally:
-            time.sleep(random.uniform(MIN_FILE_DELAY_S, MAX_FILE_DELAY_S))
 
 class ForcedNetworkScanThread(threading.Thread):
     def __init__(self, stop_event, lan_socket, lan_queue):
@@ -955,7 +1218,8 @@ class StatusDisplayThread(threading.Thread):
                 self._conn_analysis = analyze_network_connections()
                 last_net_analysis_time = time.time()
             self.draw_ui(stdscr)
-            time.sleep(0.5)
+            # 【优化】提高 UI 刷新频率以更实时地显示极速回环速度
+            time.sleep(0.2)
             try:
                 if stdscr.getch() == ord('q'): EXIT_FLAG.set()
             except curses.error: pass
@@ -985,7 +1249,7 @@ class StatusDisplayThread(threading.Thread):
         win.addstr(y, x, " " * (w - 1), curses.color_pair(2))
         title = " 全球法布施 (引擎: 定时调速) | 按 'q' 退出 "
         win.addstr(y, x + (w - len(title)) // 2, title, curses.color_pair(2) | curses.A_BOLD)
-        try: traffic_str = f"本月已发送: {load_state().get('total_sent_gb', 0):.4f} GB"
+        try: traffic_str = "" # 移除本月已发送统计
         except Exception: traffic_str = "本月已发送: 状态加载失败..."
         queue_str = f"任务队列 (WAN/LAN/回环): {WAN_TASK_QUEUE.qsize()}/{LAN_TASK_QUEUE.qsize()}/{LOOPBACK_TASK_QUEUE.qsize()}"
         with params_lock: workers_str = f"并发线程: {CURRENT_TARGET_WORKERS}"
@@ -996,13 +1260,13 @@ class StatusDisplayThread(threading.Thread):
         
         # 获取各类别速度
         speeds = get_category_speeds()
-        speed_line1 = f"全球: {format_speed(speeds['全球发送'])} | 回环: {format_speed(speeds['本地回环'])} | 广播: {format_speed(speeds['局域网广播'])}"
-        speed_line2 = f"表面扫描: {format_speed(speeds['表面扫描'])} | 元数据: {format_speed(speeds['元数据扫描'])}"
+        speed_line1 = f"全球: {format_speed(speeds['全球发送']):<12} | 回环: {format_speed(speeds['本地回环']):<12} | 广播: {format_speed(speeds['局域网广播']):<12}"
+        speed_line2 = f"表面扫描: {format_speed(speeds['表面扫描']):<12} | 元数据: {format_speed(speeds['元数据扫描']):<12}"
         
-        win.addstr(y + 2, x + 2, f"{traffic_str:<40} {queue_str:<35} {workers_str:<20}")
-        win.addstr(y + 3, x + 2, f"{hotspot_str:<50} {speed_line1[:w-54]}")
+        win.addstr(y + 2, x + 2, f"{traffic_str:<35} {queue_str:<40} {workers_str:<15}")
+        win.addstr(y + 3, x + 2, f"{hotspot_str:<45} {speed_line1}")
         if h > 4:
-            win.addstr(y + 4, x + 2, speed_line2[:w-4])
+            win.addstr(y + 4, x + 2, f"{' ':<45} {speed_line2}")
     def draw_status_table(self, win, y, x, h, w):
         win.addstr(y, x + 1, " 任务状态 (包含发送速度) ", curses.A_REVERSE)
         header = f"{'线程名称':<25} | {'文件/模式':<35} | {'进度':<22} | {'详情/速度'}"
@@ -1023,6 +1287,19 @@ class StatusDisplayThread(threading.Thread):
                     except ValueError: progress_display = f"{progress_raw:<18}"
                 else: progress_display = f"{str(progress_raw):<18}"
                 details_str = status.get('details', '')
+                # 【优化】如果 details 包含速度，确保速度部分可见
+                if '|' in details_str:
+                    parts = details_str.split('|')
+                    if len(parts) > 1:
+                        speed_part = parts[-1].strip()
+                        info_part = parts[0].strip()
+                        # 根据剩余宽度分配
+                        remaining_w = w - (25 + 3 + 35 + 3 + 22 + 3) - 2
+                        if remaining_w > 0:
+                            if len(details_str) > remaining_w:
+                                # 优先保证速度显示
+                                details_str = f"{info_part[:max(0, remaining_w-len(speed_part)-5)]}... | {speed_part}"
+                
                 line_str = f"{name:<25} | {file_str:<35} | {progress_display:<22} | {details_str}"
                 try:
                     win.addstr(y + 3 + i, x, line_str[:w - 1])
@@ -1058,16 +1335,11 @@ class StartupDriveScanner(threading.Thread):
         self.daemon, self.name = True, "驱动器扫描器"
     def run(self):
         global DYNAMIC_SOURCE_DIRS
-        if not PSUTIL_AVAILABLE:
-            log_message(f"[!] [{self.name}] 已禁用 ('psutil' 不可用)，仅使用默认目录。")
-            with source_dirs_lock:
-                if os.path.isdir(DEFAULT_SOURCE_DIRECTORY): DYNAMIC_SOURCE_DIRS = [DEFAULT_SOURCE_DIRECTORY]
-            return
         log_message(f"[*] {self.name} 已启动，开始进行一次性驱动器扫描...")
         with STATUS_LOCK: WORKER_STATUS[self.name] = {"file": "N/A", "mode": "检测驱动器", "progress": "50.0%", "details": "正在扫描分区..."}
         found_dirs = {os.path.realpath(DEFAULT_SOURCE_DIRECTORY)}
         try:
-            for p in psutil.disk_partitions(all=False):
+            for p in linux_get_disk_partitions(all_partitions=False):
                 if 'cdrom' in p.opts or p.fstype == '' or 'loop' in p.device or 'ro' in p.opts: continue
                 if os.name == 'nt' and 'rw' not in p.opts: continue
                 # 【修改】包含外置硬盘 - 不再跳过removable/external设备
@@ -1175,7 +1447,7 @@ class ExternalDriveMonitorThread(threading.Thread):
         """扫描所有有效驱动器并返回挂载点集合"""
         drives = set()
         try:
-            for p in psutil.disk_partitions(all=False):
+            for p in linux_get_disk_partitions(all_partitions=False):
                 if self._is_valid_drive(p):
                     drives.add(os.path.realpath(p.mountpoint))
         except Exception as e:
@@ -1183,10 +1455,6 @@ class ExternalDriveMonitorThread(threading.Thread):
         return drives
 
     def run(self):
-        if not PSUTIL_AVAILABLE:
-            log_message(f"[!] [{self.name}] 已禁用 ('psutil' 不可用)。")
-            return
-        
         log_message(f"[*] [{self.name}] 引擎已启动，每 {self.scan_interval} 秒扫描一次驱动器变化。")
         
         # 初始化已知驱动器列表
@@ -1216,7 +1484,7 @@ class ExternalDriveMonitorThread(threading.Thread):
                     # 获取分区信息用于日志
                     drive_type = "未知类型"
                     try:
-                        for p in psutil.disk_partitions(all=False):
+                        for p in linux_get_disk_partitions(all_partitions=False):
                             if os.path.realpath(p.mountpoint) == drive:
                                 drive_type = self._detect_drive_type(p)
                                 break
@@ -1311,8 +1579,6 @@ class FileScannerThread(threading.Thread):
             if self.name in WORKER_STATUS: del WORKER_STATUS[self.name]
         log_message(f"[*] {self.name} 线程已停止。")
     def process_file(self, file_path):
-        if load_state()['total_sent_gb'] >= MONTHLY_LIMIT_GB:
-            log_message(f"\n[!] 已达到月度流量上限。{self.name} 暂停..."); time.sleep(3600); return
         file_handle, renamer_thread, renamer_stop_event = None, None, None
         try:
             if not os.path.exists(file_path): return
@@ -1324,7 +1590,6 @@ class FileScannerThread(threading.Thread):
                 renamer_thread = RenamerThread(file_path, renamer_stop_event); renamer_thread.start()
             chunk_index = 0
             while not EXIT_FLAG.is_set():
-                if load_state()['total_sent_gb'] >= MONTHLY_LIMIT_GB: break
                 chunk_data = file_handle.read(CHUNK_SIZE)
                 if not chunk_data: break
                 packet = struct.pack('!I', chunk_index) + hashlib.md5(chunk_data).digest() + chunk_data
@@ -1332,8 +1597,8 @@ class FileScannerThread(threading.Thread):
                 task = (packet, os.path.basename(file_path), file_size, file_handle.tell())
                 
                 self.wan_queue.put(task)
-                if self.lan_socket is not None:
-                    self.lan_queue.put(task)
+                # 【修改】始终向局域网队列添加任务（即使 lan_socket 为 None，广播线程会处理）
+                self.lan_queue.put(task)
                 
                 progress = (file_handle.tell() / file_size) * 100
                 with STATUS_LOCK:
@@ -1378,9 +1643,6 @@ class ChunkSenderWorker(threading.Thread):
                     if bytes_sent > 0:
                         # 更新速度统计
                         update_speed_stats(self.name, bytes_sent)
-                        with session_bytes_lock: 
-                            global session_total_bytes_sent
-                            session_total_bytes_sent += bytes_sent
                 
                 self.task_queue.task_done()
             except queue.Empty:
@@ -1435,41 +1697,6 @@ class WorkerManagerThread(threading.Thread):
             if self.name in WORKER_STATUS: del WORKER_STATUS[self.name]
         log_message(f"[*] {self.name} 线程已停止。")
 
-class StateSaveThread(threading.Thread):
-    def __init__(self, stop_event, interval_s=60):
-        super().__init__()
-        self.stop_event, self.interval_s = stop_event, interval_s
-        self.daemon, self.name = True, "状态保存器"
-        self.cleanup_counter = 0
-    def run(self):
-        log_message(f"[*] {self.name} 已启动，每 {self.interval_s} 秒保存一次。")
-        while not self.stop_event.wait(self.interval_s): 
-            self.save_current_state()
-            # 每5次保存周期清理一次不活跃的速度统计
-            self.cleanup_counter += 1
-            if self.cleanup_counter >= 5:
-                cleanup_inactive_speed_stats()
-                self.cleanup_counter = 0
-        log_message(f"[*] {self.name} 正在执行最后一次状态保存..."); self.save_current_state()
-        log_message(f"[*] {self.name} 线程已停止。")
-    def save_current_state(self):
-        global session_total_bytes_sent
-        bytes_to_save = 0
-        with session_bytes_lock:
-            if session_total_bytes_sent > 0:
-                bytes_to_save = session_total_bytes_sent
-                session_total_bytes_sent = 0
-        
-        if bytes_to_save > 0:
-            try:
-                state = load_state()
-                bytes_gb = bytes_to_save / (1024 ** 3)
-                state['total_sent_gb'] += bytes_gb
-                save_state(state)
-                log_message(f"[*] [状态保存] 已将 {bytes_gb:.4f} GB 添加到月度总计。")
-            except Exception as e:
-                log_message(f"[!] [状态保存] 保存状态时出错: {e}")
-
 # ==============================================================================
 # --- 状态管理与工具函数 ---
 # ==============================================================================
@@ -1485,27 +1712,10 @@ def graceful_shutdown(signum, frame):
     log_message("[*] 清理完成，程序即将退出。")
 
 def load_state():
-    state_path = os.path.join(BASE_DIRECTORY, STATE_FILE_PATH)
-    current_month_str = datetime.now().strftime("%Y-%m")
-    try:
-        with state_lock, open(state_path, 'r') as f:
-            state = json.load(f)
-        if state.get('current_month') != current_month_str:
-            log_message("[*] 检测到新的月份。重置流量计数器。")
-            state = {'current_month': current_month_str, 'total_sent_gb': 0.0}
-            save_state(state)
-        return state
-    except (FileNotFoundError, json.JSONDecodeError):
-        state = {'current_month': current_month_str, 'total_sent_gb': 0.0}
-        save_state(state)
-        return state
+    return {'current_month': datetime.now().strftime("%Y-%m"), 'total_sent_gb': 0.0}
 
 def save_state(state):
-    state_path = os.path.join(BASE_DIRECTORY, STATE_FILE_PATH)
-    try:
-        with state_lock, open(state_path, 'w') as f:
-            json.dump(state, f, indent=4)
-    except Exception as e: log_message(f"[!] 严重错误: 无法保存状态文件 '{state_path}': {e}")
+    pass
 
 def load_country_database(blocks_path, locations_path):
     blocks_path = os.path.join(BASE_DIRECTORY, blocks_path)
@@ -1571,9 +1781,8 @@ def scan_network_devices():
     return sorted(list(set(devices)))
 
 def analyze_network_connections():
-    if not PSUTIL_AVAILABLE: return "psutil不可用，无法分析连接"
     try:
-        total_count = len([c for c in psutil.net_connections(kind='inet') if c.status == 'ESTABLISHED'])
+        total_count = linux_get_net_connections()
         device_status = "禁用"
         if ENABLE_FORCED_LAN_SCAN:
             device_status = f"{len(scan_network_devices())}个设备"
@@ -1606,6 +1815,8 @@ def send_chunk_in_batches(sock, packet, target_ip_pool):
         try:
             sock.sendto(packet, (target_ip_pool[i], random.randint(10240, 65535)))
             bytes_sent += packet_len
+            # 【关键修复】每发送一个包都上报统计，解决因 time.sleep 导致的统计滞后
+            update_speed_stats(threading.current_thread().name, packet_len)
         except OSError: pass
         if (i + 1) % batch_size == 0 and i < pool_len -1:
             time.sleep(delay)
@@ -1651,7 +1862,7 @@ def main():
     log_message("[*] 欢迎使用全球法布施。正在初始化...")
 
     script_name = os.path.basename(__file__)
-    files_to_exclude = {script_name, ASN_BLOCKS_DB_PATH, COUNTRY_BLOCKS_DB_PATH, COUNTRY_LOCATIONS_DB_PATH, STATE_FILE_PATH, 'nohup.out'}
+    files_to_exclude = {script_name, ASN_BLOCKS_DB_PATH, COUNTRY_BLOCKS_DB_PATH, COUNTRY_LOCATIONS_DB_PATH, 'nohup.out'}
     
     wired_interface, wireless_interface = find_specific_interfaces()
     global_socket, lan_socket = None, None
@@ -1670,17 +1881,23 @@ def main():
     except Exception as e: log_message(f"[!] 严重错误: 无法创建广域网套接字: {e}"); return
 
     if ENABLE_FORCED_LAN_SCAN:
-        if wireless_interface:
-            try:
-                lan_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                lan_socket.bind((wireless_interface['ip'], 0))
-                log_message(f"[*] [局域网发送] 成功绑定到无线网卡: {wireless_interface['name']} ({wireless_interface['ip']})")
-            except Exception as e:
-                log_message(f"[!] [局域网发送] 绑定无线网卡失败: {e}。局域网广播将禁用。")
-                if lan_socket: lan_socket.close()
-                lan_socket = None
-        else:
-            log_message("[!] [局域网发送] 未找到无线网卡。局域网广播已禁用。")
+        # 【修改】优先使用无线网卡，无线不可用时回退到有线网卡，都不可用时使用默认套接字
+        lan_interface = wireless_interface or wired_interface
+        try:
+            lan_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            if lan_interface:
+                try:
+                    lan_socket.bind((lan_interface['ip'], 0))
+                    interface_type = "无线网卡" if wireless_interface else "有线网卡"
+                    log_message(f"[*] [局域网发送] 成功绑定到{interface_type}: {lan_interface['name']} ({lan_interface['ip']})")
+                except Exception as e:
+                    log_message(f"[!] [局域网发送] 绑定网卡失败: {e}。将使用默认接口。")
+                    # 重新创建套接字使用默认接口
+                    lan_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            else:
+                log_message("[*] [局域网发送] 未找到特定网卡，使用默认接口进行广播。")
+        except Exception as e:
+            log_message(f"[!] [局域网发送] 创建套接字失败: {e}。局域网广播将禁用。")
             lan_socket = None
 
     country_db = load_country_database(COUNTRY_BLOCKS_DB_PATH, COUNTRY_LOCATIONS_DB_PATH)
@@ -1694,9 +1911,14 @@ def main():
     lan_scanner_thread = ForcedNetworkScanThread(EXIT_FLAG, lan_socket, LAN_TASK_QUEUE); lan_scanner_thread.start(); active_threads.append(lan_scanner_thread)
     
     if ENABLE_LOOPBACK_SEND:
-        loopback_thread = LoopbackSenderThread(EXIT_FLAG, files_to_exclude); loopback_thread.start(); active_threads.append(loopback_thread)
+        # 【极速优化】启动多个回环发送器线程并行发送
+        log_message(f"[*] 启动 {LOOPBACK_THREAD_COUNT} 个极速回环发送器...")
+        for i in range(LOOPBACK_THREAD_COUNT):
+            loopback_thread = LoopbackSenderThread(EXIT_FLAG, files_to_exclude, thread_id=i)
+            loopback_thread.start()
+            active_threads.append(loopback_thread)
     
-    state_saver = StateSaveThread(EXIT_FLAG); state_saver.start(); active_threads.append(state_saver)
+    # state_saver 线程已移除
     
     worker_manager = WorkerManagerThread(WAN_TASK_QUEUE, global_socket, target_ip_pool); worker_manager.start(); active_threads.append(worker_manager)
     
