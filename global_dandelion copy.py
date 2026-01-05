@@ -377,7 +377,8 @@ def get_category_speeds():
         '本地回环': 0,
         '局域网广播': 0,
         '表面扫描': 0,
-        '元数据扫描': 0
+        '元数据扫描': 0,
+        '5G热点': 0
     }
     
     current_time = time.time()
@@ -387,6 +388,8 @@ def get_category_speeds():
             # 【修复】更宽松的归类逻辑，涵盖数字命名的端口发送器
             if '回环发送器' in worker_name:
                 speeds['本地回环'] += speed
+            elif '5G热点' in worker_name:
+                speeds['5G热点'] += speed
             elif '发送器' in worker_name or '端口' in worker_name:
                 speeds['全球发送'] += speed
             elif '广播器' in worker_name:
@@ -697,8 +700,7 @@ class HotspotDataBroadcaster(threading.Thread):
         self.hotspot_channel = HOTSPOT_CHANNEL
         self.hotspot_ip = "192.168.100.1"  # 为热点分配固定的子网
         self.broadcast_interval = HOTSPOT_BROADCAST_INTERVAL
-        self.chunk_size = 1400  # 【优化】提升至接近 MTU 的大小 (1400 < 1500)
-        self.broadcast_addr = ".".join(self.hotspot_ip.split('.')[:-1]) + ".255" # 【优化】预计算广播地址
+        self.chunk_size = CHUNK_SIZE
 
     def _run_command(self, command, suppress_errors=False):
         try:
@@ -734,6 +736,19 @@ class HotspotDataBroadcaster(threading.Thread):
             f"ignore_broadcast_ssid=0\n"
         )
 
+        # 【新增】自动检测网卡：如果配置的网卡不存在，尝试自动查找
+        if not os.path.exists(f"/sys/class/net/{self.wifi_interface}"):
+            log_message(f'[*] [热点] 配置的网卡 {self.wifi_interface} 不存在，尝试自动检测无线网卡...')
+            _, auto_wifi = find_specific_interfaces()
+            if auto_wifi and auto_wifi['name'] != self.wifi_interface:
+                log_message(f'[+] [热点] 自动发现并切换到无线网卡: {auto_wifi["name"]}')
+                self.wifi_interface = auto_wifi['name']
+                # 更新配置字符串中的 interface
+                hostapd_config = hostapd_config.replace(f"interface={WIFI_INTERFACE}", f"interface={self.wifi_interface}")
+            else:
+                log_message(f'[!] [热点] 关键错误: 找不到可用的无线网卡。')
+                return False
+
         try:
             with open(self.conf_path, 'w') as f:
                 f.write(hostapd_config)
@@ -764,10 +779,8 @@ class HotspotDataBroadcaster(threading.Thread):
         try:
             self.broadcast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            # 【优化】设置极大的发送缓冲区以支持爆发性流量
-            self.broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024 * 2) 
             self.broadcast_socket.bind((self.hotspot_ip, 0))
-            log_message('[*] [热点] UDP广播套接字已就绪 (SO_SNDBUF=2MB)。')
+            log_message('[*] [热点] UDP广播套接字已就绪。')
         except Exception as e:
             log_message(f'[!] [热点] 创建广播套接字失败: {e}')
             return False
@@ -843,51 +856,21 @@ class HotspotDataBroadcaster(threading.Thread):
                         
                         with open(file_path, 'rb') as f:
                             chunk_index = 0
-                            bytes_since_last_stat = 0
-                            last_stat_update = time.time()
-                            
                             while not self.stop_event.is_set():
-                                chunk = f.read(c_size)
+                                chunk = f.read(self.chunk_size)
                                 if not chunk: break
                                 packet = self.create_broadcast_packet(file_path, chunk, chunk_index)
                                 if packet:
-                                    b_sock.sendto(packet, (b_addr, 33333))
-                                    packet_len = len(packet)
-                                    bytes_since_last_stat += packet_len
-                                    
-                                    # 【优化】批量更新统计和状态，减少颗粒度过细导致的锁竞争
-                                    # 每 1MB 或 0.5 秒更新一次
-                                    current_now = time.time()
-                                    if bytes_since_last_stat > 1024 * 1024 or current_now - last_stat_update > 0.5:
-                                        with HOTSPOT_LOCK: 
-                                            HOTSPOT_STATUS['bytes_transmitted'] += bytes_since_last_stat
-                                        
-                                        progress = (f.tell() / file_size) * 100 if file_size > 0 else 100
-                                        details = f'频道:{self.hotspot_channel} IP:{self.hotspot_ip}'
-                                        
-                                        # 更新速度统计
-                                        update_speed_stats(self.name, bytes_since_last_stat)
-                                        
-                                        with STATUS_LOCK: 
-                                            WORKER_STATUS[self.name] = {
-                                                "file": filename, 
-                                                "mode": "5G广播", 
-                                                "progress": f'{progress:.1f}%', 
-                                                "details": details
-                                            }
-                                        
-                                        bytes_since_last_stat = 0
-                                        last_stat_update = current_now
-                                        
+                                    broadcast_addr = ".".join(self.hotspot_ip.split('.')[:-1]) + ".255"
+                                    self.broadcast_socket.sendto(packet, (broadcast_addr, 33333))
+                                    with HOTSPOT_LOCK: HOTSPOT_STATUS['bytes_transmitted'] += len(packet)
+                                progress = (f.tell() / file_size) * 100 if file_size > 0 else 100
+                                # 更新速度统计
+                                update_speed_stats(self.name, len(packet))
+                                with STATUS_LOCK: WORKER_STATUS[self.name] = {"file": filename, "mode": "5G广播", "progress": '{:.1f}%'.format(progress), "details": '频道:{} IP:{}'.format(self.hotspot_channel, self.hotspot_ip)}
                                 chunk_index += 1
-                                if b_interval > 0:
-                                    time.sleep(b_interval)
+                                time.sleep(self.broadcast_interval)
                         
-                        # 完成一个文件，确保最后一点数据被计入
-                        if bytes_since_last_stat > 0:
-                            with HOTSPOT_LOCK: HOTSPOT_STATUS['bytes_transmitted'] += bytes_since_last_stat
-                            update_speed_stats(self.name, bytes_since_last_stat)
-                            
                         with HOTSPOT_LOCK: HOTSPOT_STATUS['files_broadcast'] += 1
                     except Exception as e:
                         log_message(f'[!] [{self.name}] 广播文件 {os.path.basename(file_path)} 时出错: {e}')
@@ -1254,12 +1237,13 @@ class StatusDisplayThread(threading.Thread):
         queue_str = f"任务队列 (WAN/LAN/回环): {WAN_TASK_QUEUE.qsize()}/{LAN_TASK_QUEUE.qsize()}/{LOOPBACK_TASK_QUEUE.qsize()}"
         with params_lock: workers_str = f"并发线程: {CURRENT_TARGET_WORKERS}"
         
-        # 5G热点状态
-        with HOTSPOT_LOCK:
-            hotspot_str = f"5G热点: {'活跃' if HOTSPOT_STATUS['active'] else '停止'} | 已广播: {HOTSPOT_STATUS['files_broadcast']} 文件 {HOTSPOT_STATUS['bytes_transmitted'] / (1024*1024):.2f}MB"
-        
         # 获取各类别速度
         speeds = get_category_speeds()
+        
+        # 5G热点状态
+        with HOTSPOT_LOCK:
+            hotspot_str = f"5G热点: {'活跃' if HOTSPOT_STATUS['active'] else '停止'} | {format_speed(speeds['5G热点'])} | 已广播: {HOTSPOT_STATUS['files_broadcast']} F"
+        
         speed_line1 = f"全球: {format_speed(speeds['全球发送']):<12} | 回环: {format_speed(speeds['本地回环']):<12} | 广播: {format_speed(speeds['局域网广播']):<12}"
         speed_line2 = f"表面扫描: {format_speed(speeds['表面扫描']):<12} | 元数据: {format_speed(speeds['元数据扫描']):<12}"
         
